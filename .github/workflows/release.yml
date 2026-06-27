@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Git tag to publish, for example v4.6.7
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      QBT_GPG_PRIVATE_KEY: ${{ secrets.QBT_GPG_PRIVATE_KEY }}
+      QBT_GPG_PASSPHRASE: ${{ secrets.QBT_GPG_PASSPHRASE }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install repository and release dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patch rsync
+          python3 -m pip install --upgrade pip pytest
+
+      - name: Resolve release tag
+        env:
+          RELEASE_TAG_INPUT: ${{ inputs.release_tag }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="${RELEASE_TAG_INPUT}"
+          fi
+
+          if [[ -z "${release_tag}" ]]; then
+            printf 'missing release tag\n' >&2
+            exit 1
+          fi
+
+          printf 'QBT_RELEASE_TAG=%s\n' "${release_tag}" >> "${GITHUB_ENV}"
+
+      - name: Check out resolved release ref
+        run: |
+          git fetch --force --tags origin "${QBT_RELEASE_TAG}"
+          git checkout --force "${QBT_RELEASE_TAG}"
+
+      - name: Validate wrapper and release scripts
+        run: |
+          bash -n packaging/qbt-static/run-static-build.sh
+          bash -n packaging/qbt-static/in-container-build.sh
+          bash -n packaging/qbt-static/stage-release-assets.sh
+          python3 -m pytest tests/test_qbt_static_wrapper.py -q
+
+      - name: Build static artifact
+        run: bash packaging/qbt-static/run-static-build.sh build
+
+      - name: Import optional release signing key
+        if: ${{ env.QBT_GPG_PRIVATE_KEY != '' }}
+        run: |
+          export GNUPGHOME="${RUNNER_TEMP}/gnupg"
+          mkdir -p "${GNUPGHOME}"
+          chmod 700 "${GNUPGHOME}"
+          printf '%s' "${QBT_GPG_PRIVATE_KEY}" | gpg --batch --import
+
+          key_id="$(gpg --batch --with-colons --list-secret-keys | awk -F: '/^sec:/ {print $5; exit}')"
+          if [[ -z "${key_id}" ]]; then
+            printf 'missing imported release key\n' >&2
+            exit 1
+          fi
+
+          {
+            printf 'GNUPGHOME=%s\n' "${GNUPGHOME}"
+            printf 'QBT_RELEASE_GPG_KEY_ID=%s\n' "${key_id}"
+            if [[ -n "${QBT_GPG_PASSPHRASE:-}" ]]; then
+              printf 'QBT_RELEASE_GPG_PASSPHRASE=%s\n' "${QBT_GPG_PASSPHRASE}"
+            fi
+          } >> "${GITHUB_ENV}"
+
+      - name: Stage release assets and SHA256SUMS
+        run: bash packaging/qbt-static/stage-release-assets.sh "${RUNNER_TEMP}/release-assets"
+
+      - name: Publish GitHub Release assets
+        run: |
+          release_dir="${RUNNER_TEMP}/release-assets"
+
+          if gh release view "${QBT_RELEASE_TAG}" > /dev/null 2>&1; then
+            gh release upload "${QBT_RELEASE_TAG}" "${release_dir}"/* --clobber
+          else
+            gh release create "${QBT_RELEASE_TAG}" "${release_dir}"/* \
+              --title "qBittorrent static ${QBT_RELEASE_TAG}" \
+              --notes "Static build wrapper release assets for ${QBT_RELEASE_TAG}."
+          fi

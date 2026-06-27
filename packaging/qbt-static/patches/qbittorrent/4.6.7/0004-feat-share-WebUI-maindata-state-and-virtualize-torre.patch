@@ -1,0 +1,4843 @@
+From ea6058c4f725321b32a4c6e0c75f91ec0cd0a795 Mon Sep 17 00:00:00 2001
+From: cancelpt <cancelpt@gmail.com>
+Date: Mon, 27 Apr 2026 06:43:54 +0800
+Subject: [PATCH 4/4] feat: share WebUI maindata state and virtualize torrent
+ list
+
+---
+ src/base/http/connection.cpp                  |   7 +-
+ src/base/http/responsebuilder.cpp             |   5 +-
+ src/base/http/responsegenerator.cpp           |  16 +-
+ src/base/http/responsegenerator.h             |   2 +
+ src/webui/CMakeLists.txt                      |   2 +
+ src/webui/api/apicontroller.cpp               |   5 +
+ src/webui/api/apicontroller.h                 |  13 +-
+ src/webui/api/maindatasyncstore.cpp           | 994 ++++++++++++++++++
+ src/webui/api/maindatasyncstore.h             | 176 ++++
+ src/webui/api/synccontroller.cpp              | 561 +---------
+ src/webui/api/synccontroller.h                |  67 +-
+ src/webui/webapplication.cpp                  |  16 +-
+ src/webui/webapplication.h                    |  12 +-
+ src/webui/www/private/index.html              |   1 +
+ src/webui/www/private/scripts/dynamicTable.js | 513 +++++++--
+ .../www/private/scripts/torrent-list-state.js | 119 +++
+ src/webui/www/private/views/transferlist.html |   2 +
+ src/webui/www/webui.qrc                       |   1 +
+ test/CMakeLists.txt                           |   5 +
+ test/testhttpresponsegenerator.cpp            |  89 ++
+ test/testwebuimaindatasync.cpp                | 266 +++++
+ .../webui/dynamictable-browser-smoke.test.mjs | 161 +++
+ .../webui/dynamictable-logical-order.test.mjs | 157 +++
+ .../dynamictable-virtualization.test.mjs      | 713 +++++++++++++
+ .../virtualized-torrent-list-browser.html     | 276 +++++
+ test/webui/torrentliststate.test.mjs          |  93 ++
+ 26 files changed, 3568 insertions(+), 704 deletions(-)
+ create mode 100644 src/webui/api/maindatasyncstore.cpp
+ create mode 100644 src/webui/api/maindatasyncstore.h
+ create mode 100644 src/webui/www/private/scripts/torrent-list-state.js
+ create mode 100644 test/testhttpresponsegenerator.cpp
+ create mode 100644 test/testwebuimaindatasync.cpp
+ create mode 100644 test/webui/dynamictable-browser-smoke.test.mjs
+ create mode 100644 test/webui/dynamictable-logical-order.test.mjs
+ create mode 100644 test/webui/dynamictable-virtualization.test.mjs
+ create mode 100644 test/webui/fixtures/virtualized-torrent-list-browser.html
+ create mode 100644 test/webui/torrentliststate.test.mjs
+
+diff --git a/src/base/http/connection.cpp b/src/base/http/connection.cpp
+index f6514e3..5424032 100644
+--- a/src/base/http/connection.cpp
++++ b/src/base/http/connection.cpp
+@@ -172,7 +172,12 @@ void Connection::read()
+ 
+ void Connection::sendResponse(const Response &response) const
+ {
+-    m_socket->write(toByteArray(response));
++    Response preparedResponse = response;
++    prepareResponse(preparedResponse);
++
++    m_socket->write(responseHeadersToByteArray(preparedResponse));
++    if (!preparedResponse.content.isEmpty())
++        m_socket->write(preparedResponse.content);
+ }
+ 
+ bool Connection::hasExpired(const qint64 timeout) const
+diff --git a/src/base/http/responsebuilder.cpp b/src/base/http/responsebuilder.cpp
+index 74a6348..8454eaf 100644
+--- a/src/base/http/responsebuilder.cpp
++++ b/src/base/http/responsebuilder.cpp
+@@ -65,5 +65,8 @@ void ResponseBuilder::print_impl(const QByteArray &data, const QString &type)
+     if (!m_response.headers.contains(HEADER_CONTENT_TYPE))
+         m_response.headers[HEADER_CONTENT_TYPE] = type;
+ 
+-    m_response.content += data;
++    if (m_response.content.isEmpty())
++        m_response.content = data;
++    else
++        m_response.content += data;
+ }
+diff --git a/src/base/http/responsegenerator.cpp b/src/base/http/responsegenerator.cpp
+index b34b973..88d2f95 100644
+--- a/src/base/http/responsegenerator.cpp
++++ b/src/base/http/responsegenerator.cpp
+@@ -34,16 +34,19 @@
+ #include "base/http/types.h"
+ #include "base/utils/gzip.h"
+ 
+-QByteArray Http::toByteArray(Response response)
++void Http::prepareResponse(Response &response)
+ {
+     compressContent(response);
+ 
+     response.headers[HEADER_DATE] = httpDate();
+     if (QString &value = response.headers[HEADER_CONTENT_LENGTH]; value.isEmpty())
+         value = QString::number(response.content.length());
++}
+ 
++QByteArray Http::responseHeadersToByteArray(const Response &response)
++{
+     QByteArray buf;
+-    buf.reserve(1024 + response.content.length());
++    buf.reserve(1024);
+ 
+     // Status Line
+     buf.append("HTTP/1.1 ")  // TODO: depends on request
+@@ -64,6 +67,15 @@ QByteArray Http::toByteArray(Response response)
+     // the first empty line
+     buf += CRLF;
+ 
++    return buf;
++}
++
++QByteArray Http::toByteArray(Response response)
++{
++    prepareResponse(response);
++
++    QByteArray buf = responseHeadersToByteArray(response);
++
+     // message body
+     buf += response.content;
+ 
+diff --git a/src/base/http/responsegenerator.h b/src/base/http/responsegenerator.h
+index 23139f5..301722a 100644
+--- a/src/base/http/responsegenerator.h
++++ b/src/base/http/responsegenerator.h
+@@ -37,6 +37,8 @@ namespace Http
+ {
+     struct Response;
+ 
++    void prepareResponse(Response &response);
++    QByteArray responseHeadersToByteArray(const Response &response);
+     QByteArray toByteArray(Response response);
+     QString httpDate();
+     void compressContent(Response &response);
+diff --git a/src/webui/CMakeLists.txt b/src/webui/CMakeLists.txt
+index 610774a..62b38a4 100644
+--- a/src/webui/CMakeLists.txt
++++ b/src/webui/CMakeLists.txt
+@@ -6,6 +6,7 @@ add_library(qbt_webui STATIC
+     api/authcontroller.h
+     api/isessionmanager.h
+     api/logcontroller.h
++    api/maindatasyncstore.h
+     api/rsscontroller.h
+     api/searchcontroller.h
+     api/synccontroller.h
+@@ -22,6 +23,7 @@ add_library(qbt_webui STATIC
+     api/appcontroller.cpp
+     api/authcontroller.cpp
+     api/logcontroller.cpp
++    api/maindatasyncstore.cpp
+     api/rsscontroller.cpp
+     api/searchcontroller.cpp
+     api/synccontroller.cpp
+diff --git a/src/webui/api/apicontroller.cpp b/src/webui/api/apicontroller.cpp
+index ac3942f..3f0aea3 100644
+--- a/src/webui/api/apicontroller.cpp
++++ b/src/webui/api/apicontroller.cpp
+@@ -97,3 +97,8 @@ void APIController::setResult(const QByteArray &result)
+ {
+     m_result = result;
+ }
++
++void APIController::setResult(const QByteArray &result, const QString &contentType)
++{
++    m_result = QVariant::fromValue(RawAPIResult {result, contentType});
++}
+diff --git a/src/webui/api/apicontroller.h b/src/webui/api/apicontroller.h
+index e748bc9..ebdf834 100644
+--- a/src/webui/api/apicontroller.h
++++ b/src/webui/api/apicontroller.h
+@@ -28,17 +28,25 @@
+ 
+ #pragma once
+ 
++#include <QByteArray>
+ #include <QtContainerFwd>
+ #include <QObject>
++#include <QString>
+ #include <QVariant>
+ 
+ #include "base/applicationcomponent.h"
+ 
+-class QString;
+-
+ using DataMap = QHash<QString, QByteArray>;
+ using StringMap = QHash<QString, QString>;
+ 
++struct RawAPIResult
++{
++    QByteArray data;
++    QString contentType;
++};
++
++Q_DECLARE_METATYPE(RawAPIResult)
++
+ class APIController : public QObject, public ApplicationComponent
+ {
+     Q_OBJECT
+@@ -58,6 +66,7 @@ protected:
+     void setResult(const QJsonArray &result);
+     void setResult(const QJsonObject &result);
+     void setResult(const QByteArray &result);
++    void setResult(const QByteArray &result, const QString &contentType);
+ 
+ private:
+     StringMap m_params;
+diff --git a/src/webui/api/maindatasyncstore.cpp b/src/webui/api/maindatasyncstore.cpp
+new file mode 100644
+index 0000000..b3efb8c
+--- /dev/null
++++ b/src/webui/api/maindatasyncstore.cpp
+@@ -0,0 +1,994 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL". If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include "maindatasyncstore.h"
++
++#include <QMetaType>
++#include <QJsonArray>
++#include <QJsonDocument>
++
++#include "base/algorithm.h"
++#include "base/bittorrent/cachestatus.h"
++#include "base/bittorrent/session.h"
++#include "base/bittorrent/sessionstatus.h"
++#include "base/bittorrent/torrent.h"
++#include "base/bittorrent/trackerentry.h"
++#include "base/global.h"
++#include "base/preferences.h"
++#include "base/utils/string.h"
++#include "serialize/serialize_torrent.h"
++
++namespace
++{
++    const QString KEY_SYNC_MAINDATA_QUEUEING = u"queueing"_s;
++    const QString KEY_SYNC_MAINDATA_REFRESH_INTERVAL = u"refresh_interval"_s;
++    const QString KEY_SYNC_MAINDATA_USE_ALT_SPEED_LIMITS = u"use_alt_speed_limits"_s;
++    const QString KEY_SYNC_MAINDATA_USE_SUBCATEGORIES = u"use_subcategories"_s;
++
++    const QString KEY_TRANSFER_CONNECTION_STATUS = u"connection_status"_s;
++    const QString KEY_TRANSFER_DHT_NODES = u"dht_nodes"_s;
++    const QString KEY_TRANSFER_DLDATA = u"dl_info_data"_s;
++    const QString KEY_TRANSFER_DLRATELIMIT = u"dl_rate_limit"_s;
++    const QString KEY_TRANSFER_DLSPEED = u"dl_info_speed"_s;
++    const QString KEY_TRANSFER_FREESPACEONDISK = u"free_space_on_disk"_s;
++    const QString KEY_TRANSFER_UPDATA = u"up_info_data"_s;
++    const QString KEY_TRANSFER_UPRATELIMIT = u"up_rate_limit"_s;
++    const QString KEY_TRANSFER_UPSPEED = u"up_info_speed"_s;
++    const QString KEY_TRANSFER_ALLTIME_DL = u"alltime_dl"_s;
++    const QString KEY_TRANSFER_ALLTIME_UL = u"alltime_ul"_s;
++    const QString KEY_TRANSFER_AVERAGE_TIME_QUEUE = u"average_time_queue"_s;
++    const QString KEY_TRANSFER_GLOBAL_RATIO = u"global_ratio"_s;
++    const QString KEY_TRANSFER_QUEUED_IO_JOBS = u"queued_io_jobs"_s;
++    const QString KEY_TRANSFER_READ_CACHE_HITS = u"read_cache_hits"_s;
++    const QString KEY_TRANSFER_READ_CACHE_OVERLOAD = u"read_cache_overload"_s;
++    const QString KEY_TRANSFER_TOTAL_BUFFERS_SIZE = u"total_buffers_size"_s;
++    const QString KEY_TRANSFER_TOTAL_PEER_CONNECTIONS = u"total_peer_connections"_s;
++    const QString KEY_TRANSFER_TOTAL_QUEUED_SIZE = u"total_queued_size"_s;
++    const QString KEY_TRANSFER_TOTAL_WASTE_SESSION = u"total_wasted_session"_s;
++    const QString KEY_TRANSFER_WRITE_CACHE_OVERLOAD = u"write_cache_overload"_s;
++
++    const QString KEY_SUFFIX_REMOVED = u"_removed"_s;
++
++    const QString KEY_CATEGORIES = u"categories"_s;
++    const QString KEY_CATEGORIES_REMOVED = KEY_CATEGORIES + KEY_SUFFIX_REMOVED;
++    const QString KEY_TAGS = u"tags"_s;
++    const QString KEY_TAGS_REMOVED = KEY_TAGS + KEY_SUFFIX_REMOVED;
++    const QString KEY_TORRENTS = u"torrents"_s;
++    const QString KEY_TORRENTS_REMOVED = KEY_TORRENTS + KEY_SUFFIX_REMOVED;
++    const QString KEY_TRACKERS = u"trackers"_s;
++    const QString KEY_TRACKERS_REMOVED = KEY_TRACKERS + KEY_SUFFIX_REMOVED;
++    const QString KEY_SERVER_STATE = u"server_state"_s;
++    const QString KEY_FULL_UPDATE = u"full_update"_s;
++    const QString KEY_RESPONSE_ID = u"rid"_s;
++
++    QVariantMap getTransferInfo()
++    {
++        QVariantMap map;
++        const auto *session = BitTorrent::Session::instance();
++
++        const BitTorrent::SessionStatus &sessionStatus = session->status();
++        const BitTorrent::CacheStatus &cacheStatus = session->cacheStatus();
++        map[KEY_TRANSFER_DLSPEED] = sessionStatus.payloadDownloadRate;
++        map[KEY_TRANSFER_DLDATA] = sessionStatus.totalPayloadDownload;
++        map[KEY_TRANSFER_UPSPEED] = sessionStatus.payloadUploadRate;
++        map[KEY_TRANSFER_UPDATA] = sessionStatus.totalPayloadUpload;
++        map[KEY_TRANSFER_DLRATELIMIT] = session->downloadSpeedLimit();
++        map[KEY_TRANSFER_UPRATELIMIT] = session->uploadSpeedLimit();
++
++        const qint64 atd = sessionStatus.allTimeDownload;
++        const qint64 atu = sessionStatus.allTimeUpload;
++        map[KEY_TRANSFER_ALLTIME_DL] = atd;
++        map[KEY_TRANSFER_ALLTIME_UL] = atu;
++        map[KEY_TRANSFER_TOTAL_WASTE_SESSION] = sessionStatus.totalWasted;
++        map[KEY_TRANSFER_GLOBAL_RATIO] = ((atd > 0) && (atu > 0))
++            ? Utils::String::fromDouble(static_cast<qreal>(atu) / atd, 2)
++            : u"-"_s;
++        map[KEY_TRANSFER_TOTAL_PEER_CONNECTIONS] = sessionStatus.peersCount;
++
++        const qreal readRatio = cacheStatus.readRatio;
++        map[KEY_TRANSFER_READ_CACHE_HITS] = (readRatio > 0)
++            ? Utils::String::fromDouble(100 * readRatio, 2)
++            : u"0"_s;
++        map[KEY_TRANSFER_TOTAL_BUFFERS_SIZE] = cacheStatus.totalUsedBuffers * 16 * 1024;
++
++        map[KEY_TRANSFER_WRITE_CACHE_OVERLOAD] = ((sessionStatus.diskWriteQueue > 0) && (sessionStatus.peersCount > 0))
++            ? Utils::String::fromDouble((100. * sessionStatus.diskWriteQueue / sessionStatus.peersCount), 2)
++            : u"0"_s;
++        map[KEY_TRANSFER_READ_CACHE_OVERLOAD] = ((sessionStatus.diskReadQueue > 0) && (sessionStatus.peersCount > 0))
++            ? Utils::String::fromDouble((100. * sessionStatus.diskReadQueue / sessionStatus.peersCount), 2)
++            : u"0"_s;
++
++        map[KEY_TRANSFER_QUEUED_IO_JOBS] = cacheStatus.jobQueueLength;
++        map[KEY_TRANSFER_AVERAGE_TIME_QUEUE] = cacheStatus.averageJobTime;
++        map[KEY_TRANSFER_TOTAL_QUEUED_SIZE] = cacheStatus.queuedBytes;
++
++        map[KEY_TRANSFER_DHT_NODES] = sessionStatus.dhtNodes;
++        map[KEY_TRANSFER_CONNECTION_STATUS] = session->isListening()
++            ? (sessionStatus.hasIncomingConnections ? u"connected"_s : u"firewalled"_s)
++            : u"disconnected"_s;
++
++        return map;
++    }
++
++    void processList(QVariantList prevData, const QVariantList &data, QVariantList &syncData, QVariantList &removedItems);
++    void processHash(QVariantHash prevData, const QVariantHash &data, QVariantMap &syncData, QVariantList &removedItems);
++
++    void processMap(const QVariantMap &prevData, const QVariantMap &data, QVariantMap &syncData)
++    {
++        syncData.clear();
++
++        for (auto i = data.cbegin(); i != data.cend(); ++i)
++        {
++            const QString &key = i.key();
++            const QVariant &value = i.value();
++            QVariantList removedItems;
++
++            switch (static_cast<QMetaType::Type>(value.type()))
++            {
++            case QMetaType::QVariantMap:
++                {
++                    QVariantMap map;
++                    processMap(prevData[key].toMap(), value.toMap(), map);
++                    if (!map.isEmpty())
++                        syncData[key] = map;
++                }
++                break;
++            case QMetaType::QVariantHash:
++                {
++                    QVariantMap map;
++                    processHash(prevData[key].toHash(), value.toHash(), map, removedItems);
++                    if (!map.isEmpty())
++                        syncData[key] = map;
++                    if (!removedItems.isEmpty())
++                        syncData[key + KEY_SUFFIX_REMOVED] = removedItems;
++                }
++                break;
++            case QMetaType::QVariantList:
++                {
++                    QVariantList list;
++                    processList(prevData[key].toList(), value.toList(), list, removedItems);
++                    if (!list.isEmpty())
++                        syncData[key] = list;
++                    if (!removedItems.isEmpty())
++                        syncData[key + KEY_SUFFIX_REMOVED] = removedItems;
++                }
++                break;
++            case QMetaType::QString:
++            case QMetaType::LongLong:
++            case QMetaType::Float:
++            case QMetaType::Int:
++            case QMetaType::Bool:
++            case QMetaType::Double:
++            case QMetaType::ULongLong:
++            case QMetaType::UInt:
++            case QMetaType::QDateTime:
++            case QMetaType::Nullptr:
++                if (prevData[key] != value)
++                    syncData[key] = value;
++                break;
++            default:
++                Q_ASSERT_X(false, "processMap"
++                           , u"Unexpected type: %1"_s
++                           .arg(QString::fromLatin1(QMetaType::typeName(static_cast<QMetaType::Type>(value.type()))))
++                           .toUtf8().constData());
++            }
++        }
++    }
++
++    void processHash(QVariantHash prevData, const QVariantHash &data, QVariantMap &syncData, QVariantList &removedItems)
++    {
++        syncData.clear();
++        removedItems.clear();
++
++        if (prevData.isEmpty())
++        {
++            for (auto i = data.cbegin(); i != data.cend(); ++i)
++                syncData[i.key()] = i.value();
++        }
++        else
++        {
++            for (auto i = data.cbegin(); i != data.cend(); ++i)
++            {
++                switch (i.value().type())
++                {
++                case QVariant::Map:
++                    if (!prevData.contains(i.key()))
++                    {
++                        syncData[i.key()] = i.value();
++                    }
++                    else
++                    {
++                        QVariantMap map;
++                        processMap(prevData[i.key()].toMap(), i.value().toMap(), map);
++                        prevData.remove(i.key());
++                        if (!map.isEmpty())
++                            syncData[i.key()] = map;
++                    }
++                    break;
++                case QVariant::StringList:
++                    if (!prevData.contains(i.key()))
++                    {
++                        syncData[i.key()] = i.value();
++                    }
++                    else
++                    {
++                        QVariantList list;
++                        QVariantList removedList;
++                        processList(prevData[i.key()].toList(), i.value().toList(), list, removedList);
++                        prevData.remove(i.key());
++                        if (!list.isEmpty() || !removedList.isEmpty())
++                            syncData[i.key()] = i.value();
++                    }
++                    break;
++                default:
++                    Q_ASSERT(false);
++                    break;
++                }
++            }
++
++            if (!prevData.isEmpty())
++            {
++                for (auto i = prevData.cbegin(); i != prevData.cend(); ++i)
++                    removedItems << i.key();
++            }
++        }
++    }
++
++    void processList(QVariantList prevData, const QVariantList &data, QVariantList &syncData, QVariantList &removedItems)
++    {
++        syncData.clear();
++        removedItems.clear();
++
++        if (prevData.isEmpty())
++        {
++            syncData = data;
++        }
++        else
++        {
++            for (const QVariant &item : data)
++            {
++                if (!prevData.contains(item))
++                    syncData.append(item);
++                else
++                    prevData.removeOne(item);
++            }
++
++            if (!prevData.isEmpty())
++                removedItems = prevData;
++        }
++    }
++
++    int nextRid(const int currentRid)
++    {
++        return ((currentRid % 1000000) + 1);
++    }
++
++    void mergeVariantMap(QVariantMap &target, const QVariantMap &delta)
++    {
++        for (auto it = delta.cbegin(); it != delta.cend(); ++it)
++        {
++            if ((it.value().type() == QVariant::Map) && (target.value(it.key()).type() == QVariant::Map))
++            {
++                QVariantMap nestedTarget = target.value(it.key()).toMap();
++                mergeVariantMap(nestedTarget, it.value().toMap());
++                target[it.key()] = nestedTarget;
++                continue;
++            }
++
++            target[it.key()] = it.value();
++        }
++    }
++
++    void appendUnique(QVariantList &list, const QVariant &item)
++    {
++        if (!list.contains(item))
++            list.append(item);
++    }
++
++    void appendUnique(QStringList &list, const QString &item)
++    {
++        if (!list.contains(item))
++            list.append(item);
++    }
++
++    void applyDeltaToSnapshot(WebUISync::MaindataSyncData &snapshot, const WebUISync::MaindataSyncData &delta)
++    {
++        for (auto it = delta.categories.cbegin(); it != delta.categories.cend(); ++it)
++            mergeVariantMap(snapshot.categories[it.key()], it.value());
++        for (const QString &category : asConst(delta.removedCategories))
++            snapshot.categories.remove(category);
++
++        for (const QVariant &tag : asConst(delta.tags))
++            appendUnique(snapshot.tags, tag);
++        for (const QString &tag : asConst(delta.removedTags))
++            snapshot.tags.removeOne(tag);
++
++        for (auto it = delta.torrents.cbegin(); it != delta.torrents.cend(); ++it)
++            mergeVariantMap(snapshot.torrents[it.key()], it.value());
++        for (const QString &torrentID : asConst(delta.removedTorrents))
++            snapshot.torrents.remove(torrentID);
++
++        for (auto it = delta.trackers.cbegin(); it != delta.trackers.cend(); ++it)
++            snapshot.trackers[it.key()] = it.value();
++        for (const QString &tracker : asConst(delta.removedTrackers))
++            snapshot.trackers.remove(tracker);
++
++        mergeVariantMap(snapshot.serverState, delta.serverState);
++    }
++
++    void mergeDeltaIntoAggregate(WebUISync::MaindataSyncData &aggregate, const WebUISync::MaindataSyncData &delta)
++    {
++        for (auto it = delta.categories.cbegin(); it != delta.categories.cend(); ++it)
++        {
++            aggregate.removedCategories.removeOne(it.key());
++            mergeVariantMap(aggregate.categories[it.key()], it.value());
++        }
++        for (const QString &category : asConst(delta.removedCategories))
++        {
++            aggregate.categories.remove(category);
++            appendUnique(aggregate.removedCategories, category);
++        }
++
++        for (const QVariant &tag : asConst(delta.tags))
++        {
++            aggregate.removedTags.removeOne(tag.toString());
++            appendUnique(aggregate.tags, tag);
++        }
++        for (const QString &tag : asConst(delta.removedTags))
++        {
++            aggregate.tags.removeOne(tag);
++            appendUnique(aggregate.removedTags, tag);
++        }
++
++        for (auto it = delta.torrents.cbegin(); it != delta.torrents.cend(); ++it)
++        {
++            aggregate.removedTorrents.removeOne(it.key());
++            mergeVariantMap(aggregate.torrents[it.key()], it.value());
++        }
++        for (const QString &torrentID : asConst(delta.removedTorrents))
++        {
++            aggregate.torrents.remove(torrentID);
++            appendUnique(aggregate.removedTorrents, torrentID);
++        }
++
++        for (auto it = delta.trackers.cbegin(); it != delta.trackers.cend(); ++it)
++        {
++            aggregate.removedTrackers.removeOne(it.key());
++            aggregate.trackers[it.key()] = it.value();
++        }
++        for (const QString &tracker : asConst(delta.removedTrackers))
++        {
++            aggregate.trackers.remove(tracker);
++            appendUnique(aggregate.removedTrackers, tracker);
++        }
++
++        mergeVariantMap(aggregate.serverState, delta.serverState);
++    }
++
++    QJsonObject toJsonObject(const WebUISync::MaindataSyncData &data)
++    {
++        QJsonObject syncData;
++
++        if (!data.categories.isEmpty())
++        {
++            QJsonObject categories;
++            for (auto it = data.categories.cbegin(); it != data.categories.cend(); ++it)
++                categories[it.key()] = QJsonObject::fromVariantMap(it.value());
++            syncData[KEY_CATEGORIES] = categories;
++        }
++        if (!data.removedCategories.isEmpty())
++            syncData[KEY_CATEGORIES_REMOVED] = QJsonArray::fromStringList(data.removedCategories);
++
++        if (!data.tags.isEmpty())
++            syncData[KEY_TAGS] = QJsonArray::fromVariantList(data.tags);
++        if (!data.removedTags.isEmpty())
++            syncData[KEY_TAGS_REMOVED] = QJsonArray::fromStringList(data.removedTags);
++
++        if (!data.torrents.isEmpty())
++        {
++            QJsonObject torrents;
++            for (auto it = data.torrents.cbegin(); it != data.torrents.cend(); ++it)
++                torrents[it.key()] = QJsonObject::fromVariantMap(it.value());
++            syncData[KEY_TORRENTS] = torrents;
++        }
++        if (!data.removedTorrents.isEmpty())
++            syncData[KEY_TORRENTS_REMOVED] = QJsonArray::fromStringList(data.removedTorrents);
++
++        if (!data.trackers.isEmpty())
++        {
++            QJsonObject trackers;
++            for (auto it = data.trackers.cbegin(); it != data.trackers.cend(); ++it)
++                trackers[it.key()] = QJsonArray::fromStringList(it.value());
++            syncData[KEY_TRACKERS] = trackers;
++        }
++        if (!data.removedTrackers.isEmpty())
++            syncData[KEY_TRACKERS_REMOVED] = QJsonArray::fromStringList(data.removedTrackers);
++
++        if (!data.serverState.isEmpty())
++            syncData[KEY_SERVER_STATE] = QJsonObject::fromVariantMap(data.serverState);
++
++        return syncData;
++    }
++
++    QByteArray serializeResponse(const WebUISync::MaindataSyncData &data, const bool fullUpdate, const int responseRid)
++    {
++        QJsonObject response = toJsonObject(data);
++        if (fullUpdate)
++            response[KEY_FULL_UPDATE] = true;
++        response[KEY_RESPONSE_ID] = responseRid;
++        return QJsonDocument(response).toJson(QJsonDocument::Compact);
++    }
++
++    qsizetype estimatePayloadBytes(const WebUISync::MaindataSyncData &data)
++    {
++        return QJsonDocument(toJsonObject(data)).toJson(QJsonDocument::Compact).size();
++    }
++}
++
++bool WebUISync::MaindataSyncData::isEmpty() const
++{
++    return categories.isEmpty()
++        && tags.isEmpty()
++        && torrents.isEmpty()
++        && trackers.isEmpty()
++        && serverState.isEmpty()
++        && removedCategories.isEmpty()
++        && removedTags.isEmpty()
++        && removedTorrents.isEmpty()
++        && removedTrackers.isEmpty();
++}
++
++WebUISync::MaindataSyncPlan WebUISync::planMaindataSync(MaindataSessionCursor &cursor
++    , const int requestedRid, const qint64 currentRevision, const qint64 earliestRetainedRevision)
++{
++    bool fullUpdate = true;
++    if ((requestedRid > 0) && (cursor.lastSentRid > 0))
++    {
++        if (cursor.lastSentRid == requestedRid)
++        {
++            cursor.acceptedRid = requestedRid;
++            cursor.acceptedRevision = cursor.lastSentRevision;
++        }
++
++        const qint64 earliestIncrementalBaseRevision = qMax<qint64>(0, (earliestRetainedRevision - 1));
++        if ((cursor.acceptedRid == requestedRid) && (cursor.acceptedRevision >= earliestIncrementalBaseRevision))
++            fullUpdate = false;
++    }
++
++    const MaindataSyncPlan plan
++    {
++        fullUpdate,
++        (fullUpdate ? 0 : cursor.acceptedRevision),
++        currentRevision,
++        nextRid(cursor.lastSentRid)
++    };
++
++    cursor.lastSentRid = plan.responseRid;
++    cursor.lastSentRevision = currentRevision;
++    return plan;
++}
++
++WebUISync::MaindataRevisionStore::MaindataRevisionStore(const qsizetype maxRetainedRevisions
++    , const qsizetype maxEstimatedPayloadBytes)
++    : m_maxRetainedRevisions(maxRetainedRevisions)
++    , m_maxEstimatedPayloadBytes(maxEstimatedPayloadBytes)
++{
++}
++
++void WebUISync::MaindataRevisionStore::initialize(const MaindataSyncData &snapshot)
++{
++    m_snapshot = snapshot;
++    m_revisions.clear();
++    m_retainedPayloadBytes = 0;
++    m_currentRevision = 1;
++}
++
++void WebUISync::MaindataRevisionStore::storeRevision(const MaindataSyncData &delta)
++{
++    Q_ASSERT(m_currentRevision > 0);
++    if (delta.isEmpty())
++        return;
++
++    applyDeltaToSnapshot(m_snapshot, delta);
++
++    RevisionEntry entry;
++    entry.revision = ++m_currentRevision;
++    entry.delta = delta;
++    entry.estimatedPayloadBytes = estimatePayloadBytes(delta);
++    m_revisions.append(entry);
++    m_retainedPayloadBytes += entry.estimatedPayloadBytes;
++
++    evictRevisions();
++}
++
++qint64 WebUISync::MaindataRevisionStore::currentRevision() const
++{
++    return m_currentRevision;
++}
++
++qint64 WebUISync::MaindataRevisionStore::earliestRetainedRevision() const
++{
++    if (m_currentRevision == 0)
++        return 1;
++
++    if (m_revisions.isEmpty())
++        return (m_currentRevision + 1);
++
++    return m_revisions.constFirst().revision;
++}
++
++const WebUISync::MaindataSyncData &WebUISync::MaindataRevisionStore::snapshot() const
++{
++    return m_snapshot;
++}
++
++QByteArray WebUISync::MaindataRevisionStore::buildInitialFullUpdateResponse(MaindataSessionCursor &cursor
++    , const int requestedRid) const
++{
++    Q_ASSERT(m_currentRevision > 0);
++
++    const bool isFreshSession = (requestedRid == 0)
++        && (cursor.acceptedRid == 0)
++        && (cursor.acceptedRevision == 0)
++        && (cursor.lastSentRid == 0)
++        && (cursor.lastSentRevision == 0);
++    if (!isFreshSession)
++        return {};
++
++    const MaindataSyncPlan plan = planMaindataSync(cursor, requestedRid, m_currentRevision, earliestRetainedRevision());
++    Q_ASSERT(plan.fullUpdate);
++    Q_ASSERT(plan.responseRid == 1);
++    Q_ASSERT(plan.targetRevision == m_currentRevision);
++
++    if (m_cachedInitialFullUpdateRevision != m_currentRevision)
++    {
++        m_cachedInitialFullUpdateResponse = serializeResponse(m_snapshot, true, plan.responseRid);
++        m_cachedInitialFullUpdateRevision = m_currentRevision;
++    }
++
++    return m_cachedInitialFullUpdateResponse;
++}
++
++QJsonObject WebUISync::MaindataRevisionStore::buildResponse(MaindataSessionCursor &cursor, const int requestedRid) const
++{
++    Q_ASSERT(m_currentRevision > 0);
++
++    const MaindataSyncPlan plan = planMaindataSync(cursor, requestedRid, m_currentRevision, earliestRetainedRevision());
++
++    QJsonObject response = toJsonObject(plan.fullUpdate
++        ? m_snapshot
++        : aggregateRange(plan.baseRevision, plan.targetRevision));
++
++    if (plan.fullUpdate)
++        response[KEY_FULL_UPDATE] = true;
++    response[KEY_RESPONSE_ID] = plan.responseRid;
++
++    return response;
++}
++
++WebUISync::MaindataSyncData WebUISync::MaindataRevisionStore::aggregateRange(const qint64 baseRevision
++    , const qint64 targetRevision) const
++{
++    MaindataSyncData aggregate;
++
++    for (const RevisionEntry &entry : asConst(m_revisions))
++    {
++        if ((entry.revision <= baseRevision) || (entry.revision > targetRevision))
++            continue;
++
++        mergeDeltaIntoAggregate(aggregate, entry.delta);
++    }
++
++    return aggregate;
++}
++
++void WebUISync::MaindataRevisionStore::evictRevisions()
++{
++    while (!m_revisions.isEmpty()
++        && ((m_revisions.size() > m_maxRetainedRevisions)
++            || (m_retainedPayloadBytes > m_maxEstimatedPayloadBytes)))
++    {
++        m_retainedPayloadBytes -= m_revisions.constFirst().estimatedPayloadBytes;
++        m_revisions.removeFirst();
++    }
++}
++
++WebUISync::MaindataSyncStore::MaindataSyncStore(QObject *parent)
++    : QObject(parent)
++{
++    const auto *session = BitTorrent::Session::instance();
++    connect(session, &BitTorrent::Session::categoryAdded, this, &MaindataSyncStore::onCategoryAdded);
++    connect(session, &BitTorrent::Session::categoryRemoved, this, &MaindataSyncStore::onCategoryRemoved);
++    connect(session, &BitTorrent::Session::categoryOptionsChanged, this, &MaindataSyncStore::onCategoryOptionsChanged);
++    connect(session, &BitTorrent::Session::subcategoriesSupportChanged, this, &MaindataSyncStore::onSubcategoriesSupportChanged);
++    connect(session, &BitTorrent::Session::tagAdded, this, &MaindataSyncStore::onTagAdded);
++    connect(session, &BitTorrent::Session::tagRemoved, this, &MaindataSyncStore::onTagRemoved);
++    connect(session, &BitTorrent::Session::torrentAdded, this, &MaindataSyncStore::onTorrentAdded);
++    connect(session, &BitTorrent::Session::torrentAboutToBeRemoved, this, &MaindataSyncStore::onTorrentAboutToBeRemoved);
++    connect(session, &BitTorrent::Session::torrentCategoryChanged, this, &MaindataSyncStore::onTorrentCategoryChanged);
++    connect(session, &BitTorrent::Session::torrentMetadataReceived, this, &MaindataSyncStore::onTorrentMetadataReceived);
++    connect(session, &BitTorrent::Session::torrentPaused, this, &MaindataSyncStore::onTorrentPaused);
++    connect(session, &BitTorrent::Session::torrentResumed, this, &MaindataSyncStore::onTorrentResumed);
++    connect(session, &BitTorrent::Session::torrentSavePathChanged, this, &MaindataSyncStore::onTorrentSavePathChanged);
++    connect(session, &BitTorrent::Session::torrentSavingModeChanged, this, &MaindataSyncStore::onTorrentSavingModeChanged);
++    connect(session, &BitTorrent::Session::torrentTagAdded, this, &MaindataSyncStore::onTorrentTagAdded);
++    connect(session, &BitTorrent::Session::torrentTagRemoved, this, &MaindataSyncStore::onTorrentTagRemoved);
++    connect(session, &BitTorrent::Session::torrentsUpdated, this, &MaindataSyncStore::onTorrentsUpdated);
++    connect(session, &BitTorrent::Session::trackersChanged, this, &MaindataSyncStore::onTorrentTrackersChanged);
++}
++
++void WebUISync::MaindataSyncStore::updateFreeDiskSpace(const qint64 freeDiskSpace)
++{
++    m_freeDiskSpace = freeDiskSpace;
++}
++
++QByteArray WebUISync::MaindataSyncStore::buildInitialFullUpdateResponse(MaindataSessionCursor &cursor
++    , const int requestedRid)
++{
++    ensureInitialized();
++    storePendingRevision();
++    return m_revisionStore.buildInitialFullUpdateResponse(cursor, requestedRid);
++}
++
++QJsonObject WebUISync::MaindataSyncStore::buildResponse(MaindataSessionCursor &cursor, const int requestedRid)
++{
++    ensureInitialized();
++    storePendingRevision();
++    return m_revisionStore.buildResponse(cursor, requestedRid);
++}
++
++void WebUISync::MaindataSyncStore::ensureInitialized()
++{
++    if (m_revisionStore.currentRevision() > 0)
++        return;
++
++    initializeSnapshot();
++}
++
++void WebUISync::MaindataSyncStore::initializeSnapshot()
++{
++    m_knownTrackers.clear();
++    clearDirtyState();
++
++    MaindataSyncData snapshot;
++    const auto *session = BitTorrent::Session::instance();
++
++    for (const BitTorrent::Torrent *torrent : asConst(session->torrents()))
++    {
++        const BitTorrent::TorrentID torrentID = torrent->id();
++
++        QVariantMap serializedTorrent = serialize(*torrent);
++        serializedTorrent.remove(KEY_TORRENT_ID);
++
++        for (const BitTorrent::TrackerEntry &tracker : asConst(torrent->trackers()))
++            m_knownTrackers[tracker.url].insert(torrentID);
++
++        snapshot.torrents[torrentID.toString()] = serializedTorrent;
++    }
++
++    const QStringList categoriesList = session->categories();
++    for (const QString &categoryName : categoriesList)
++    {
++        QJsonObject category = session->categoryOptions(categoryName).toJSON();
++        category[u"savePath"_s] = category.take(u"save_path"_s);
++        category.insert(u"name"_s, categoryName);
++        snapshot.categories[categoryName] = category.toVariantMap();
++    }
++
++    for (const QString &tag : asConst(session->tags()))
++        snapshot.tags.append(tag);
++
++    for (auto trackersIter = m_knownTrackers.cbegin(); trackersIter != m_knownTrackers.cend(); ++trackersIter)
++    {
++        QStringList torrentIDs;
++        for (const BitTorrent::TorrentID &torrentID : asConst(trackersIter.value()))
++            torrentIDs.append(torrentID.toString());
++
++        snapshot.trackers[trackersIter.key()] = torrentIDs;
++    }
++
++    snapshot.serverState = getTransferInfo();
++    snapshot.serverState[KEY_TRANSFER_FREESPACEONDISK] = m_freeDiskSpace;
++    snapshot.serverState[KEY_SYNC_MAINDATA_QUEUEING] = session->isQueueingSystemEnabled();
++    snapshot.serverState[KEY_SYNC_MAINDATA_USE_ALT_SPEED_LIMITS] = session->isAltGlobalSpeedLimitEnabled();
++    snapshot.serverState[KEY_SYNC_MAINDATA_REFRESH_INTERVAL] = session->refreshInterval();
++    snapshot.serverState[KEY_SYNC_MAINDATA_USE_SUBCATEGORIES] = session->isSubcategoriesEnabled();
++
++    m_revisionStore.initialize(snapshot);
++}
++
++void WebUISync::MaindataSyncStore::storePendingRevision()
++{
++    const MaindataSyncData &snapshot = m_revisionStore.snapshot();
++    const auto *session = BitTorrent::Session::instance();
++
++    MaindataSyncData delta;
++
++    for (const QString &categoryName : asConst(m_updatedCategories))
++    {
++        auto category = session->categoryOptions(categoryName).toJSON().toVariantMap();
++        category[u"savePath"_s] = category.take(u"save_path"_s);
++        category.insert(u"name"_s, categoryName);
++        processMap(snapshot.categories.value(categoryName), category, delta.categories[categoryName]);
++    }
++    m_updatedCategories.clear();
++
++    for (const QString &category : asConst(m_removedCategories))
++        delta.removedCategories.append(category);
++    m_removedCategories.clear();
++
++    for (const QString &tag : asConst(m_addedTags))
++        delta.tags.append(tag);
++    m_addedTags.clear();
++
++    for (const QString &tag : asConst(m_removedTags))
++        delta.removedTags.append(tag);
++    m_removedTags.clear();
++
++    for (const BitTorrent::TorrentID &torrentID : asConst(m_updatedTorrents))
++    {
++        const BitTorrent::Torrent *torrent = session->getTorrent(torrentID);
++        Q_ASSERT(torrent);
++        if (Q_UNLIKELY(!torrent))
++            continue;
++
++        QVariantMap serializedTorrent = serialize(*torrent);
++        serializedTorrent.remove(KEY_TORRENT_ID);
++        processMap(snapshot.torrents.value(torrentID.toString()), serializedTorrent, delta.torrents[torrentID.toString()]);
++    }
++    m_updatedTorrents.clear();
++
++    for (const BitTorrent::TorrentID &torrentID : asConst(m_removedTorrents))
++        delta.removedTorrents.append(torrentID.toString());
++    m_removedTorrents.clear();
++
++    for (const QString &tracker : asConst(m_updatedTrackers))
++    {
++        const QSet<BitTorrent::TorrentID> torrentIDs = m_knownTrackers.value(tracker);
++        QStringList serializedTorrentIDs;
++        serializedTorrentIDs.reserve(torrentIDs.size());
++        for (const BitTorrent::TorrentID &torrentID : asConst(torrentIDs))
++            serializedTorrentIDs.append(torrentID.toString());
++
++        delta.trackers[tracker] = serializedTorrentIDs;
++    }
++    m_updatedTrackers.clear();
++
++    for (const QString &tracker : asConst(m_removedTrackers))
++        delta.removedTrackers.append(tracker);
++    m_removedTrackers.clear();
++
++    QVariantMap serverState = getTransferInfo();
++    serverState[KEY_TRANSFER_FREESPACEONDISK] = m_freeDiskSpace;
++    serverState[KEY_SYNC_MAINDATA_QUEUEING] = session->isQueueingSystemEnabled();
++    serverState[KEY_SYNC_MAINDATA_USE_ALT_SPEED_LIMITS] = session->isAltGlobalSpeedLimitEnabled();
++    serverState[KEY_SYNC_MAINDATA_REFRESH_INTERVAL] = session->refreshInterval();
++    serverState[KEY_SYNC_MAINDATA_USE_SUBCATEGORIES] = session->isSubcategoriesEnabled();
++    processMap(snapshot.serverState, serverState, delta.serverState);
++
++    m_revisionStore.storeRevision(delta);
++}
++
++void WebUISync::MaindataSyncStore::clearDirtyState()
++{
++    m_updatedCategories.clear();
++    m_removedCategories.clear();
++    m_addedTags.clear();
++    m_removedTags.clear();
++    m_updatedTrackers.clear();
++    m_removedTrackers.clear();
++    m_updatedTorrents.clear();
++    m_removedTorrents.clear();
++}
++
++void WebUISync::MaindataSyncStore::onCategoryAdded(const QString &categoryName)
++{
++    m_removedCategories.remove(categoryName);
++    m_updatedCategories.insert(categoryName);
++}
++
++void WebUISync::MaindataSyncStore::onCategoryRemoved(const QString &categoryName)
++{
++    m_updatedCategories.remove(categoryName);
++    m_removedCategories.insert(categoryName);
++}
++
++void WebUISync::MaindataSyncStore::onCategoryOptionsChanged(const QString &categoryName)
++{
++    Q_ASSERT(!m_removedCategories.contains(categoryName));
++
++    m_updatedCategories.insert(categoryName);
++}
++
++void WebUISync::MaindataSyncStore::onSubcategoriesSupportChanged()
++{
++    const QStringList categoriesList = BitTorrent::Session::instance()->categories();
++    const QHash<QString, QVariantMap> &categories = m_revisionStore.snapshot().categories;
++    for (const QString &categoryName : categoriesList)
++    {
++        if (!categories.contains(categoryName))
++        {
++            m_removedCategories.remove(categoryName);
++            m_updatedCategories.insert(categoryName);
++        }
++    }
++}
++
++void WebUISync::MaindataSyncStore::onTagAdded(const QString &tag)
++{
++    m_removedTags.remove(tag);
++    m_addedTags.insert(tag);
++}
++
++void WebUISync::MaindataSyncStore::onTagRemoved(const QString &tag)
++{
++    m_addedTags.remove(tag);
++    m_removedTags.insert(tag);
++}
++
++void WebUISync::MaindataSyncStore::onTorrentAdded(BitTorrent::Torrent *torrent)
++{
++    const BitTorrent::TorrentID torrentID = torrent->id();
++
++    m_removedTorrents.remove(torrentID);
++    m_updatedTorrents.insert(torrentID);
++
++    for (const BitTorrent::TrackerEntry &trackerEntry : asConst(torrent->trackers()))
++    {
++        m_knownTrackers[trackerEntry.url].insert(torrentID);
++        m_updatedTrackers.insert(trackerEntry.url);
++        m_removedTrackers.remove(trackerEntry.url);
++    }
++}
++
++void WebUISync::MaindataSyncStore::onTorrentAboutToBeRemoved(BitTorrent::Torrent *torrent)
++{
++    const BitTorrent::TorrentID torrentID = torrent->id();
++
++    m_updatedTorrents.remove(torrentID);
++    m_removedTorrents.insert(torrentID);
++
++    for (const BitTorrent::TrackerEntry &trackerEntry : asConst(torrent->trackers()))
++    {
++        auto iter = m_knownTrackers.find(trackerEntry.url);
++        Q_ASSERT(iter != m_knownTrackers.end());
++        if (Q_UNLIKELY(iter == m_knownTrackers.end()))
++            continue;
++
++        QSet<BitTorrent::TorrentID> &torrentIDs = iter.value();
++        torrentIDs.remove(torrentID);
++        if (torrentIDs.isEmpty())
++        {
++            m_knownTrackers.erase(iter);
++            m_updatedTrackers.remove(trackerEntry.url);
++            m_removedTrackers.insert(trackerEntry.url);
++        }
++        else
++        {
++            m_updatedTrackers.insert(trackerEntry.url);
++        }
++    }
++}
++
++void WebUISync::MaindataSyncStore::onTorrentCategoryChanged(BitTorrent::Torrent *torrent
++        , [[maybe_unused]] const QString &oldCategory)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentMetadataReceived(BitTorrent::Torrent *torrent)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentPaused(BitTorrent::Torrent *torrent)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentResumed(BitTorrent::Torrent *torrent)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentSavePathChanged(BitTorrent::Torrent *torrent)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentSavingModeChanged(BitTorrent::Torrent *torrent)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentTagAdded(BitTorrent::Torrent *torrent, [[maybe_unused]] const QString &tag)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentTagRemoved(BitTorrent::Torrent *torrent, [[maybe_unused]] const QString &tag)
++{
++    m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentsUpdated(const QVector<BitTorrent::Torrent *> &torrents)
++{
++    for (const BitTorrent::Torrent *torrent : torrents)
++        m_updatedTorrents.insert(torrent->id());
++}
++
++void WebUISync::MaindataSyncStore::onTorrentTrackersChanged(BitTorrent::Torrent *torrent)
++{
++    using namespace BitTorrent;
++
++    const QVector<TrackerEntry> currentTrackerEntries = torrent->trackers();
++    QSet<QString> currentTrackers;
++    currentTrackers.reserve(currentTrackerEntries.size());
++    for (const TrackerEntry &currentTrackerEntry : currentTrackerEntries)
++        currentTrackers.insert(currentTrackerEntry.url);
++
++    const TorrentID torrentID = torrent->id();
++    Algorithm::removeIf(m_knownTrackers
++            , [this, torrentID, currentTrackers]
++                    (const QString &knownTracker, QSet<TorrentID> &torrentIDs)
++    {
++        if (auto idIter = torrentIDs.find(torrentID)
++                ; (idIter != torrentIDs.end()) && !currentTrackers.contains(knownTracker))
++        {
++            torrentIDs.erase(idIter);
++            if (torrentIDs.isEmpty())
++            {
++                m_updatedTrackers.remove(knownTracker);
++                m_removedTrackers.insert(knownTracker);
++                return true;
++            }
++
++            m_updatedTrackers.insert(knownTracker);
++            return false;
++        }
++
++        if (currentTrackers.contains(knownTracker) && !torrentIDs.contains(torrentID))
++        {
++            torrentIDs.insert(torrentID);
++            m_updatedTrackers.insert(knownTracker);
++            return false;
++        }
++
++        return false;
++    });
++
++    for (const QString &currentTracker : asConst(currentTrackers))
++    {
++        if (!m_knownTrackers.contains(currentTracker))
++        {
++            m_knownTrackers.insert(currentTracker, {torrentID});
++            m_updatedTrackers.insert(currentTracker);
++            m_removedTrackers.remove(currentTracker);
++        }
++    }
++}
+diff --git a/src/webui/api/maindatasyncstore.h b/src/webui/api/maindatasyncstore.h
+new file mode 100644
+index 0000000..a84b5cf
+--- /dev/null
++++ b/src/webui/api/maindatasyncstore.h
+@@ -0,0 +1,176 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL". If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#pragma once
++
++#include <QHash>
++#include <QByteArray>
++#include <QJsonObject>
++#include <QList>
++#include <QObject>
++#include <QSet>
++#include <QStringList>
++#include <QtGlobal>
++#include <QVariantMap>
++#include <QVariantList>
++
++#include "base/bittorrent/infohash.h"
++
++namespace BitTorrent
++{
++    class Torrent;
++}
++
++namespace WebUISync
++{
++    struct MaindataSyncData
++    {
++        QHash<QString, QVariantMap> categories;
++        QVariantList tags;
++        QHash<QString, QVariantMap> torrents;
++        QHash<QString, QStringList> trackers;
++        QVariantMap serverState;
++
++        QStringList removedCategories;
++        QStringList removedTags;
++        QStringList removedTorrents;
++        QStringList removedTrackers;
++
++        bool isEmpty() const;
++    };
++
++    struct MaindataSessionCursor
++    {
++        int acceptedRid = 0;
++        qint64 acceptedRevision = 0;
++        int lastSentRid = 0;
++        qint64 lastSentRevision = 0;
++    };
++
++    struct MaindataSyncPlan
++    {
++        bool fullUpdate = true;
++        qint64 baseRevision = 0;
++        qint64 targetRevision = 0;
++        int responseRid = 0;
++    };
++
++    MaindataSyncPlan planMaindataSync(MaindataSessionCursor &cursor, int requestedRid
++        , qint64 currentRevision, qint64 earliestRetainedRevision);
++
++    class MaindataRevisionStore
++    {
++    public:
++        explicit MaindataRevisionStore(qsizetype maxRetainedRevisions = 32
++            , qsizetype maxEstimatedPayloadBytes = (16 * 1024 * 1024));
++
++        void initialize(const MaindataSyncData &snapshot);
++        void storeRevision(const MaindataSyncData &delta);
++
++        qint64 currentRevision() const;
++        qint64 earliestRetainedRevision() const;
++        const MaindataSyncData &snapshot() const;
++
++        QByteArray buildInitialFullUpdateResponse(MaindataSessionCursor &cursor, int requestedRid) const;
++        QJsonObject buildResponse(MaindataSessionCursor &cursor, int requestedRid) const;
++
++    private:
++        struct RevisionEntry
++        {
++            qint64 revision = 0;
++            MaindataSyncData delta;
++            qsizetype estimatedPayloadBytes = 0;
++        };
++
++        MaindataSyncData aggregateRange(qint64 baseRevision, qint64 targetRevision) const;
++        void evictRevisions();
++
++        qsizetype m_maxRetainedRevisions = 0;
++        qsizetype m_maxEstimatedPayloadBytes = 0;
++        qsizetype m_retainedPayloadBytes = 0;
++        qint64 m_currentRevision = 0;
++        QList<RevisionEntry> m_revisions;
++        MaindataSyncData m_snapshot;
++        mutable qint64 m_cachedInitialFullUpdateRevision = 0;
++        mutable QByteArray m_cachedInitialFullUpdateResponse;
++    };
++
++    class MaindataSyncStore final : public QObject
++    {
++        Q_OBJECT
++        Q_DISABLE_COPY_MOVE(MaindataSyncStore)
++
++    public:
++        explicit MaindataSyncStore(QObject *parent = nullptr);
++
++        void updateFreeDiskSpace(qint64 freeDiskSpace);
++        QByteArray buildInitialFullUpdateResponse(MaindataSessionCursor &cursor, int requestedRid);
++        QJsonObject buildResponse(MaindataSessionCursor &cursor, int requestedRid);
++
++    private slots:
++        void onCategoryAdded(const QString &categoryName);
++        void onCategoryRemoved(const QString &categoryName);
++        void onCategoryOptionsChanged(const QString &categoryName);
++        void onSubcategoriesSupportChanged();
++        void onTagAdded(const QString &tag);
++        void onTagRemoved(const QString &tag);
++        void onTorrentAdded(BitTorrent::Torrent *torrent);
++        void onTorrentAboutToBeRemoved(BitTorrent::Torrent *torrent);
++        void onTorrentCategoryChanged(BitTorrent::Torrent *torrent, const QString &oldCategory);
++        void onTorrentMetadataReceived(BitTorrent::Torrent *torrent);
++        void onTorrentPaused(BitTorrent::Torrent *torrent);
++        void onTorrentResumed(BitTorrent::Torrent *torrent);
++        void onTorrentSavePathChanged(BitTorrent::Torrent *torrent);
++        void onTorrentSavingModeChanged(BitTorrent::Torrent *torrent);
++        void onTorrentTagAdded(BitTorrent::Torrent *torrent, const QString &tag);
++        void onTorrentTagRemoved(BitTorrent::Torrent *torrent, const QString &tag);
++        void onTorrentsUpdated(const QVector<BitTorrent::Torrent *> &torrents);
++        void onTorrentTrackersChanged(BitTorrent::Torrent *torrent);
++
++    private:
++        void ensureInitialized();
++        void initializeSnapshot();
++        void storePendingRevision();
++        void clearDirtyState();
++
++        qint64 m_freeDiskSpace = 0;
++
++        QHash<QString, QSet<BitTorrent::TorrentID>> m_knownTrackers;
++
++        QSet<QString> m_updatedCategories;
++        QSet<QString> m_removedCategories;
++        QSet<QString> m_addedTags;
++        QSet<QString> m_removedTags;
++        QSet<QString> m_updatedTrackers;
++        QSet<QString> m_removedTrackers;
++        QSet<BitTorrent::TorrentID> m_updatedTorrents;
++        QSet<BitTorrent::TorrentID> m_removedTorrents;
++
++        MaindataRevisionStore m_revisionStore;
++    };
++}
+diff --git a/src/webui/api/synccontroller.cpp b/src/webui/api/synccontroller.cpp
+index e484b21..cedda4a 100644
+--- a/src/webui/api/synccontroller.cpp
++++ b/src/webui/api/synccontroller.cpp
+@@ -48,6 +48,7 @@
+ #include "base/net/geoipmanager.h"
+ #include "base/preferences.h"
+ #include "base/utils/string.h"
++#include "base/http/types.h"
+ #include "apierror.h"
+ #include "serialize/serialize_torrent.h"
+ 
+@@ -124,51 +125,6 @@ namespace
+     void processList(QVariantList prevData, const QVariantList &data, QVariantList &syncData, QVariantList &removedItems);
+     QJsonObject generateSyncData(int acceptedResponseId, const QVariantMap &data, QVariantMap &lastAcceptedData, QVariantMap &lastData);
+ 
+-    QVariantMap getTransferInfo()
+-    {
+-        QVariantMap map;
+-        const auto *session = BitTorrent::Session::instance();
+-
+-        const BitTorrent::SessionStatus &sessionStatus = session->status();
+-        const BitTorrent::CacheStatus &cacheStatus = session->cacheStatus();
+-        map[KEY_TRANSFER_DLSPEED] = sessionStatus.payloadDownloadRate;
+-        map[KEY_TRANSFER_DLDATA] = sessionStatus.totalPayloadDownload;
+-        map[KEY_TRANSFER_UPSPEED] = sessionStatus.payloadUploadRate;
+-        map[KEY_TRANSFER_UPDATA] = sessionStatus.totalPayloadUpload;
+-        map[KEY_TRANSFER_DLRATELIMIT] = session->downloadSpeedLimit();
+-        map[KEY_TRANSFER_UPRATELIMIT] = session->uploadSpeedLimit();
+-
+-        const qint64 atd = sessionStatus.allTimeDownload;
+-        const qint64 atu = sessionStatus.allTimeUpload;
+-        map[KEY_TRANSFER_ALLTIME_DL] = atd;
+-        map[KEY_TRANSFER_ALLTIME_UL] = atu;
+-        map[KEY_TRANSFER_TOTAL_WASTE_SESSION] = sessionStatus.totalWasted;
+-        map[KEY_TRANSFER_GLOBAL_RATIO] = ((atd > 0) && (atu > 0)) ? Utils::String::fromDouble(static_cast<qreal>(atu) / atd, 2) : u"-"_s;
+-        map[KEY_TRANSFER_TOTAL_PEER_CONNECTIONS] = sessionStatus.peersCount;
+-
+-        const qreal readRatio = cacheStatus.readRatio;  // TODO: remove when LIBTORRENT_VERSION_NUM >= 20000
+-        map[KEY_TRANSFER_READ_CACHE_HITS] = (readRatio > 0) ? Utils::String::fromDouble(100 * readRatio, 2) : u"0"_s;
+-        map[KEY_TRANSFER_TOTAL_BUFFERS_SIZE] = cacheStatus.totalUsedBuffers * 16 * 1024;
+-
+-        map[KEY_TRANSFER_WRITE_CACHE_OVERLOAD] = ((sessionStatus.diskWriteQueue > 0) && (sessionStatus.peersCount > 0))
+-            ? Utils::String::fromDouble((100. * sessionStatus.diskWriteQueue / sessionStatus.peersCount), 2)
+-            : u"0"_s;
+-        map[KEY_TRANSFER_READ_CACHE_OVERLOAD] = ((sessionStatus.diskReadQueue > 0) && (sessionStatus.peersCount > 0))
+-            ? Utils::String::fromDouble((100. * sessionStatus.diskReadQueue / sessionStatus.peersCount), 2)
+-            : u"0"_s;
+-
+-        map[KEY_TRANSFER_QUEUED_IO_JOBS] = cacheStatus.jobQueueLength;
+-        map[KEY_TRANSFER_AVERAGE_TIME_QUEUE] = cacheStatus.averageJobTime;
+-        map[KEY_TRANSFER_TOTAL_QUEUED_SIZE] = cacheStatus.queuedBytes;
+-
+-        map[KEY_TRANSFER_DHT_NODES] = sessionStatus.dhtNodes;
+-        map[KEY_TRANSFER_CONNECTION_STATUS] = session->isListening()
+-            ? (sessionStatus.hasIncomingConnections ? u"connected"_s : u"firewalled"_s)
+-            : u"disconnected"_s;
+-
+-        return map;
+-    }
+-
+     // Compare two structures (prevData, data) and calculate difference (syncData).
+     // Structures encoded as map.
+     void processMap(const QVariantMap &prevData, const QVariantMap &data, QVariantMap &syncData)
+@@ -384,337 +340,26 @@ namespace
+     }
+ }
+ 
+-SyncController::SyncController(IApplication *app, QObject *parent)
++SyncController::SyncController(IApplication *app, WebUISync::MaindataSyncStore *maindataSyncStore, QObject *parent)
+     : APIController(app, parent)
++    , m_maindataSyncStore(maindataSyncStore)
+ {
+ }
+ 
+-void SyncController::updateFreeDiskSpace(const qint64 freeDiskSpace)
+-{
+-    m_freeDiskSpace = freeDiskSpace;
+-}
+-
+-// The function returns the changed data from the server to synchronize with the web client.
+-// Return value is map in JSON format.
+-// Map contain the key:
+-//  - "Rid": ID response
+-// Map can contain the keys:
+-//  - "full_update": full data update flag
+-//  - "torrents": dictionary contains information about torrents.
+-//  - "torrents_removed": a list of hashes of removed torrents
+-//  - "categories": map of categories info
+-//  - "categories_removed": list of removed categories
+-//  - "trackers": dictionary contains information about trackers
+-//  - "trackers_removed": a list of removed trackers
+-//  - "server_state": map contains information about the state of the server
+-// The keys of the 'torrents' dictionary are hashes of torrents.
+-// Each value of the 'torrents' dictionary contains map. The map can contain following keys:
+-//  - "name": Torrent name
+-//  - "size": Torrent size
+-//  - "progress": Torrent progress
+-//  - "dlspeed": Torrent download speed
+-//  - "upspeed": Torrent upload speed
+-//  - "priority": Torrent queue position (-1 if queuing is disabled)
+-//  - "num_seeds": Torrent seeds connected to
+-//  - "num_complete": Torrent seeds in the swarm
+-//  - "num_leechs": Torrent leechers connected to
+-//  - "num_incomplete": Torrent leechers in the swarm
+-//  - "ratio": Torrent share ratio
+-//  - "eta": Torrent ETA
+-//  - "state": Torrent state
+-//  - "seq_dl": Torrent sequential download state
+-//  - "f_l_piece_prio": Torrent first last piece priority state
+-//  - "completion_on": Torrent copletion time
+-//  - "tracker": Torrent tracker
+-//  - "dl_limit": Torrent download limit
+-//  - "up_limit": Torrent upload limit
+-//  - "downloaded": Amount of data downloaded
+-//  - "uploaded": Amount of data uploaded
+-//  - "downloaded_session": Amount of data downloaded since program open
+-//  - "uploaded_session": Amount of data uploaded since program open
+-//  - "amount_left": Amount of data left to download
+-//  - "save_path": Torrent save path
+-//  - "download_path": Torrent download path
+-//  - "completed": Amount of data completed
+-//  - "max_ratio": Upload max share ratio
+-//  - "max_seeding_time": Upload max seeding time
+-//  - "ratio_limit": Upload share ratio limit
+-//  - "seeding_time_limit": Upload seeding time limit
+-//  - "seen_complete": Indicates the time when the torrent was last seen complete/whole
+-//  - "last_activity": Last time when a chunk was downloaded/uploaded
+-//  - "total_size": Size including unwanted data
+-// Server state map may contain the following keys:
+-//  - "connection_status": connection status
+-//  - "dht_nodes": DHT nodes count
+-//  - "dl_info_data": bytes downloaded
+-//  - "dl_info_speed": download speed
+-//  - "dl_rate_limit: download rate limit
+-//  - "up_info_data: bytes uploaded
+-//  - "up_info_speed: upload speed
+-//  - "up_rate_limit: upload speed limit
+-//  - "queueing": queue system usage flag
+-//  - "refresh_interval": torrents table refresh interval
+-//  - "free_space_on_disk": Free space on the default save path
+ // GET param:
+ //   - rid (int): last response id
+ void SyncController::maindataAction()
+ {
+-    if (m_maindataAcceptedID < 0)
++    Q_ASSERT(m_maindataSyncStore);
++    const int requestedRid = params()[u"rid"_s].toInt();
++    if (const QByteArray initialResponse = m_maindataSyncStore->buildInitialFullUpdateResponse(m_maindataCursor, requestedRid)
++        ; !initialResponse.isEmpty())
+     {
+-        makeMaindataSnapshot();
+-
+-        const auto *btSession = BitTorrent::Session::instance();
+-        connect(btSession, &BitTorrent::Session::categoryAdded, this, &SyncController::onCategoryAdded);
+-        connect(btSession, &BitTorrent::Session::categoryRemoved, this, &SyncController::onCategoryRemoved);
+-        connect(btSession, &BitTorrent::Session::categoryOptionsChanged, this, &SyncController::onCategoryOptionsChanged);
+-        connect(btSession, &BitTorrent::Session::subcategoriesSupportChanged, this, &SyncController::onSubcategoriesSupportChanged);
+-        connect(btSession, &BitTorrent::Session::tagAdded, this, &SyncController::onTagAdded);
+-        connect(btSession, &BitTorrent::Session::tagRemoved, this, &SyncController::onTagRemoved);
+-        connect(btSession, &BitTorrent::Session::torrentAdded, this, &SyncController::onTorrentAdded);
+-        connect(btSession, &BitTorrent::Session::torrentAboutToBeRemoved, this, &SyncController::onTorrentAboutToBeRemoved);
+-        connect(btSession, &BitTorrent::Session::torrentCategoryChanged, this, &SyncController::onTorrentCategoryChanged);
+-        connect(btSession, &BitTorrent::Session::torrentMetadataReceived, this, &SyncController::onTorrentMetadataReceived);
+-        connect(btSession, &BitTorrent::Session::torrentPaused, this, &SyncController::onTorrentPaused);
+-        connect(btSession, &BitTorrent::Session::torrentResumed, this, &SyncController::onTorrentResumed);
+-        connect(btSession, &BitTorrent::Session::torrentSavePathChanged, this, &SyncController::onTorrentSavePathChanged);
+-        connect(btSession, &BitTorrent::Session::torrentSavingModeChanged, this, &SyncController::onTorrentSavingModeChanged);
+-        connect(btSession, &BitTorrent::Session::torrentTagAdded, this, &SyncController::onTorrentTagAdded);
+-        connect(btSession, &BitTorrent::Session::torrentTagRemoved, this, &SyncController::onTorrentTagRemoved);
+-        connect(btSession, &BitTorrent::Session::torrentsUpdated, this, &SyncController::onTorrentsUpdated);
+-        connect(btSession, &BitTorrent::Session::trackersChanged, this, &SyncController::onTorrentTrackersChanged);
++        setResult(initialResponse, Http::CONTENT_TYPE_JSON);
++        return;
+     }
+ 
+-    const int acceptedID = params()[u"rid"_s].toInt();
+-    bool fullUpdate = true;
+-    if ((acceptedID > 0) && (m_maindataLastSentID > 0))
+-    {
+-        if (m_maindataLastSentID == acceptedID)
+-        {
+-            m_maindataAcceptedID = acceptedID;
+-            m_maindataSyncBuf = {};
+-        }
+-
+-        if (m_maindataAcceptedID == acceptedID)
+-        {
+-            // We are still able to send changes for the current state of the data having by client.
+-            fullUpdate = false;
+-        }
+-    }
+-
+-    const int id = (m_maindataLastSentID % 1000000) + 1;  // cycle between 1 and 1000000
+-    setResult(generateMaindataSyncData(id, fullUpdate));
+-    m_maindataLastSentID = id;
+-}
+-
+-void SyncController::makeMaindataSnapshot()
+-{
+-    m_knownTrackers.clear();
+-    m_maindataAcceptedID = 0;
+-    m_maindataSnapshot = {};
+-
+-    const auto *session = BitTorrent::Session::instance();
+-
+-    for (const BitTorrent::Torrent *torrent : asConst(session->torrents()))
+-    {
+-        const BitTorrent::TorrentID torrentID = torrent->id();
+-
+-        QVariantMap serializedTorrent = serialize(*torrent);
+-        serializedTorrent.remove(KEY_TORRENT_ID);
+-
+-        for (const BitTorrent::TrackerEntry &tracker : asConst(torrent->trackers()))
+-            m_knownTrackers[tracker.url].insert(torrentID);
+-
+-        m_maindataSnapshot.torrents[torrentID.toString()] = serializedTorrent;
+-    }
+-
+-    const QStringList categoriesList = session->categories();
+-    for (const auto &categoryName : categoriesList)
+-    {
+-        const BitTorrent::CategoryOptions categoryOptions = session->categoryOptions(categoryName);
+-        QJsonObject category = categoryOptions.toJSON();
+-        // adjust it to be compatible with existing WebAPI
+-        category[u"savePath"_s] = category.take(u"save_path"_s);
+-        category.insert(u"name"_s, categoryName);
+-        m_maindataSnapshot.categories[categoryName] = category.toVariantMap();
+-    }
+-
+-    for (const QString &tag : asConst(session->tags()))
+-        m_maindataSnapshot.tags.append(tag);
+-
+-    for (auto trackersIter = m_knownTrackers.cbegin(); trackersIter != m_knownTrackers.cend(); ++trackersIter)
+-    {
+-        QStringList torrentIDs;
+-        for (const BitTorrent::TorrentID &torrentID : asConst(trackersIter.value()))
+-            torrentIDs.append(torrentID.toString());
+-
+-        m_maindataSnapshot.trackers[trackersIter.key()] = torrentIDs;
+-    }
+-
+-    m_maindataSnapshot.serverState = getTransferInfo();
+-    m_maindataSnapshot.serverState[KEY_TRANSFER_FREESPACEONDISK] = m_freeDiskSpace;
+-    m_maindataSnapshot.serverState[KEY_SYNC_MAINDATA_QUEUEING] = session->isQueueingSystemEnabled();
+-    m_maindataSnapshot.serverState[KEY_SYNC_MAINDATA_USE_ALT_SPEED_LIMITS] = session->isAltGlobalSpeedLimitEnabled();
+-    m_maindataSnapshot.serverState[KEY_SYNC_MAINDATA_REFRESH_INTERVAL] = session->refreshInterval();
+-    m_maindataSnapshot.serverState[KEY_SYNC_MAINDATA_USE_SUBCATEGORIES] = session->isSubcategoriesEnabled();
+-}
+-
+-QJsonObject SyncController::generateMaindataSyncData(const int id, const bool fullUpdate)
+-{
+-    // if need to update existing sync data
+-    for (const QString &category : asConst(m_updatedCategories))
+-        m_maindataSyncBuf.removedCategories.removeOne(category);
+-    for (const QString &category : asConst(m_removedCategories))
+-        m_maindataSyncBuf.categories.remove(category);
+-
+-    for (const QString &tag : asConst(m_addedTags))
+-        m_maindataSyncBuf.removedTags.removeOne(tag);
+-    for (const QString &tag : asConst(m_removedTags))
+-        m_maindataSyncBuf.tags.removeOne(tag);
+-
+-    for (const BitTorrent::TorrentID &torrentID : asConst(m_updatedTorrents))
+-        m_maindataSyncBuf.removedTorrents.removeOne(torrentID.toString());
+-    for (const BitTorrent::TorrentID &torrentID : asConst(m_removedTorrents))
+-        m_maindataSyncBuf.torrents.remove(torrentID.toString());
+-
+-    for (const QString &tracker : asConst(m_updatedTrackers))
+-        m_maindataSyncBuf.removedTrackers.removeOne(tracker);
+-    for (const QString &tracker : asConst(m_removedTrackers))
+-        m_maindataSyncBuf.trackers.remove(tracker);
+-
+-    const auto *session = BitTorrent::Session::instance();
+-
+-    for (const QString &categoryName : asConst(m_updatedCategories))
+-    {
+-        const BitTorrent::CategoryOptions categoryOptions = session->categoryOptions(categoryName);
+-        auto category = categoryOptions.toJSON().toVariantMap();
+-        // adjust it to be compatible with existing WebAPI
+-        category[u"savePath"_s] = category.take(u"save_path"_s);
+-        category.insert(u"name"_s, categoryName);
+-
+-        auto &categorySnapshot = m_maindataSnapshot.categories[categoryName];
+-        processMap(categorySnapshot, category, m_maindataSyncBuf.categories[categoryName]);
+-        categorySnapshot = category;
+-    }
+-    m_updatedCategories.clear();
+-
+-    for (const QString &category : asConst(m_removedCategories))
+-    {
+-        m_maindataSyncBuf.removedCategories.append(category);
+-        m_maindataSnapshot.categories.remove(category);
+-    }
+-    m_removedCategories.clear();
+-
+-    for (const QString &tag : asConst(m_addedTags))
+-    {
+-        m_maindataSyncBuf.tags.append(tag);
+-        m_maindataSnapshot.tags.append(tag);
+-    }
+-    m_addedTags.clear();
+-
+-    for (const QString &tag : asConst(m_removedTags))
+-    {
+-        m_maindataSyncBuf.removedTags.append(tag);
+-        m_maindataSnapshot.tags.removeOne(tag);
+-    }
+-    m_removedTags.clear();
+-
+-    for (const BitTorrent::TorrentID &torrentID : asConst(m_updatedTorrents))
+-    {
+-        const BitTorrent::Torrent *torrent = session->getTorrent(torrentID);
+-        Q_ASSERT(torrent);
+-
+-        QVariantMap serializedTorrent = serialize(*torrent);
+-        serializedTorrent.remove(KEY_TORRENT_ID);
+-
+-        auto &torrentSnapshot = m_maindataSnapshot.torrents[torrentID.toString()];
+-        processMap(torrentSnapshot, serializedTorrent, m_maindataSyncBuf.torrents[torrentID.toString()]);
+-        torrentSnapshot = serializedTorrent;
+-    }
+-    m_updatedTorrents.clear();
+-
+-    for (const BitTorrent::TorrentID &torrentID : asConst(m_removedTorrents))
+-    {
+-        m_maindataSyncBuf.removedTorrents.append(torrentID.toString());
+-        m_maindataSnapshot.torrents.remove(torrentID.toString());
+-    }
+-    m_removedTorrents.clear();
+-
+-    for (const QString &tracker : asConst(m_updatedTrackers))
+-    {
+-        const QSet<BitTorrent::TorrentID> torrentIDs = m_knownTrackers[tracker];
+-        QStringList serializedTorrentIDs;
+-        serializedTorrentIDs.reserve(torrentIDs.size());
+-        for (const BitTorrent::TorrentID &torrentID : torrentIDs)
+-            serializedTorrentIDs.append(torrentID.toString());
+-
+-        m_maindataSyncBuf.trackers[tracker] = serializedTorrentIDs;
+-        m_maindataSnapshot.trackers[tracker] = serializedTorrentIDs;
+-    }
+-    m_updatedTrackers.clear();
+-
+-    for (const QString &tracker : asConst(m_removedTrackers))
+-    {
+-        m_maindataSyncBuf.removedTrackers.append(tracker);
+-        m_maindataSnapshot.trackers.remove(tracker);
+-    }
+-    m_removedTrackers.clear();
+-
+-    QVariantMap serverState = getTransferInfo();
+-    serverState[KEY_TRANSFER_FREESPACEONDISK] = m_freeDiskSpace;
+-    serverState[KEY_SYNC_MAINDATA_QUEUEING] = session->isQueueingSystemEnabled();
+-    serverState[KEY_SYNC_MAINDATA_USE_ALT_SPEED_LIMITS] = session->isAltGlobalSpeedLimitEnabled();
+-    serverState[KEY_SYNC_MAINDATA_REFRESH_INTERVAL] = session->refreshInterval();
+-    serverState[KEY_SYNC_MAINDATA_USE_SUBCATEGORIES] = session->isSubcategoriesEnabled();
+-    processMap(m_maindataSnapshot.serverState, serverState, m_maindataSyncBuf.serverState);
+-    m_maindataSnapshot.serverState = serverState;
+-
+-    QJsonObject syncData;
+-    syncData[KEY_RESPONSE_ID] = id;
+-    if (fullUpdate)
+-    {
+-        m_maindataSyncBuf = m_maindataSnapshot;
+-        syncData[KEY_FULL_UPDATE] = true;
+-    }
+-
+-    if (!m_maindataSyncBuf.categories.isEmpty())
+-    {
+-        QJsonObject categories;
+-        for (auto it = m_maindataSyncBuf.categories.cbegin(); it != m_maindataSyncBuf.categories.cend(); ++it)
+-            categories[it.key()] = QJsonObject::fromVariantMap(it.value());
+-        syncData[KEY_CATEGORIES] = categories;
+-    }
+-    if (!m_maindataSyncBuf.removedCategories.isEmpty())
+-        syncData[KEY_CATEGORIES_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedCategories);
+-
+-    if (!m_maindataSyncBuf.tags.isEmpty())
+-        syncData[KEY_TAGS] = QJsonArray::fromVariantList(m_maindataSyncBuf.tags);
+-    if (!m_maindataSyncBuf.removedTags.isEmpty())
+-        syncData[KEY_TAGS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTags);
+-
+-    if (!m_maindataSyncBuf.torrents.isEmpty())
+-    {
+-        QJsonObject torrents;
+-        for (auto it = m_maindataSyncBuf.torrents.cbegin(); it != m_maindataSyncBuf.torrents.cend(); ++it)
+-            torrents[it.key()] = QJsonObject::fromVariantMap(it.value());
+-        syncData[KEY_TORRENTS] = torrents;
+-    }
+-    if (!m_maindataSyncBuf.removedTorrents.isEmpty())
+-        syncData[KEY_TORRENTS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTorrents);
+-
+-    if (!m_maindataSyncBuf.trackers.isEmpty())
+-    {
+-        QJsonObject trackers;
+-        for (auto it = m_maindataSyncBuf.trackers.cbegin(); it != m_maindataSyncBuf.trackers.cend(); ++it)
+-            trackers[it.key()] = QJsonArray::fromStringList(it.value());
+-        syncData[KEY_TRACKERS] = trackers;
+-    }
+-    if (!m_maindataSyncBuf.removedTrackers.isEmpty())
+-        syncData[KEY_TRACKERS_REMOVED] = QJsonArray::fromStringList(m_maindataSyncBuf.removedTrackers);
+-
+-    if (!m_maindataSyncBuf.serverState.isEmpty())
+-        syncData[KEY_SERVER_STATE] = QJsonObject::fromVariantMap(m_maindataSyncBuf.serverState);
+-
+-    return syncData;
++    setResult(m_maindataSyncStore->buildResponse(m_maindataCursor, requestedRid));
+ }
+ 
+ // GET param:
+@@ -780,189 +425,3 @@ void SyncController::torrentPeersAction()
+     const int acceptedResponseId = params()[u"rid"_s].toInt();
+     setResult(generateSyncData(acceptedResponseId, data, m_lastAcceptedPeersResponse, m_lastPeersResponse));
+ }
+-
+-void SyncController::onCategoryAdded(const QString &categoryName)
+-{
+-    m_removedCategories.remove(categoryName);
+-    m_updatedCategories.insert(categoryName);
+-}
+-
+-void SyncController::onCategoryRemoved(const QString &categoryName)
+-{
+-    m_updatedCategories.remove(categoryName);
+-    m_removedCategories.insert(categoryName);
+-}
+-
+-void SyncController::onCategoryOptionsChanged(const QString &categoryName)
+-{
+-    Q_ASSERT(!m_removedCategories.contains(categoryName));
+-
+-    m_updatedCategories.insert(categoryName);
+-}
+-
+-void SyncController::onSubcategoriesSupportChanged()
+-{
+-    const QStringList categoriesList = BitTorrent::Session::instance()->categories();
+-    for (const auto &categoryName : categoriesList)
+-    {
+-        if (!m_maindataSnapshot.categories.contains(categoryName))
+-        {
+-            m_removedCategories.remove(categoryName);
+-            m_updatedCategories.insert(categoryName);
+-        }
+-    }
+-}
+-
+-void SyncController::onTagAdded(const QString &tag)
+-{
+-    m_removedTags.remove(tag);
+-    m_addedTags.insert(tag);
+-}
+-
+-void SyncController::onTagRemoved(const QString &tag)
+-{
+-    m_addedTags.remove(tag);
+-    m_removedTags.insert(tag);
+-}
+-
+-void SyncController::onTorrentAdded(BitTorrent::Torrent *torrent)
+-{
+-    const BitTorrent::TorrentID torrentID = torrent->id();
+-
+-    m_removedTorrents.remove(torrentID);
+-    m_updatedTorrents.insert(torrentID);
+-
+-    for (const BitTorrent::TrackerEntry &trackerEntry : asConst(torrent->trackers()))
+-    {
+-        m_knownTrackers[trackerEntry.url].insert(torrentID);
+-        m_updatedTrackers.insert(trackerEntry.url);
+-        m_removedTrackers.remove(trackerEntry.url);
+-    }
+-}
+-
+-void SyncController::onTorrentAboutToBeRemoved(BitTorrent::Torrent *torrent)
+-{
+-    const BitTorrent::TorrentID torrentID = torrent->id();
+-
+-    m_updatedTorrents.remove(torrentID);
+-    m_removedTorrents.insert(torrentID);
+-
+-    for (const BitTorrent::TrackerEntry &trackerEntry : asConst(torrent->trackers()))
+-    {
+-        auto iter = m_knownTrackers.find(trackerEntry.url);
+-        Q_ASSERT(iter != m_knownTrackers.end());
+-        if (Q_UNLIKELY(iter == m_knownTrackers.end()))
+-            continue;
+-
+-        QSet<BitTorrent::TorrentID> &torrentIDs = iter.value();
+-        torrentIDs.remove(torrentID);
+-        if (torrentIDs.isEmpty())
+-        {
+-            m_knownTrackers.erase(iter);
+-            m_updatedTrackers.remove(trackerEntry.url);
+-            m_removedTrackers.insert(trackerEntry.url);
+-        }
+-        else
+-        {
+-            m_updatedTrackers.insert(trackerEntry.url);
+-        }
+-    }
+-}
+-
+-void SyncController::onTorrentCategoryChanged(BitTorrent::Torrent *torrent
+-        , [[maybe_unused]] const QString &oldCategory)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentMetadataReceived(BitTorrent::Torrent *torrent)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentPaused(BitTorrent::Torrent *torrent)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentResumed(BitTorrent::Torrent *torrent)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentSavePathChanged(BitTorrent::Torrent *torrent)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentSavingModeChanged(BitTorrent::Torrent *torrent)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentTagAdded(BitTorrent::Torrent *torrent, [[maybe_unused]] const QString &tag)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentTagRemoved(BitTorrent::Torrent *torrent, [[maybe_unused]] const QString &tag)
+-{
+-    m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentsUpdated(const QVector<BitTorrent::Torrent *> &torrents)
+-{
+-    for (const BitTorrent::Torrent *torrent : torrents)
+-        m_updatedTorrents.insert(torrent->id());
+-}
+-
+-void SyncController::onTorrentTrackersChanged(BitTorrent::Torrent *torrent)
+-{
+-    using namespace BitTorrent;
+-
+-    const QVector<TrackerEntry> currentTrackerEntries = torrent->trackers();
+-    QSet<QString> currentTrackers;
+-    currentTrackers.reserve(currentTrackerEntries.size());
+-    for (const TrackerEntry &currentTrackerEntry : currentTrackerEntries)
+-        currentTrackers.insert(currentTrackerEntry.url);
+-
+-    const TorrentID torrentID = torrent->id();
+-    Algorithm::removeIf(m_knownTrackers
+-            , [this, torrentID, currentTrackers]
+-                    (const QString &knownTracker, QSet<TorrentID> &torrentIDs)
+-    {
+-        if (auto idIter = torrentIDs.find(torrentID)
+-                ; (idIter != torrentIDs.end()) && !currentTrackers.contains(knownTracker))
+-        {
+-            torrentIDs.erase(idIter);
+-            if (torrentIDs.isEmpty())
+-            {
+-                m_updatedTrackers.remove(knownTracker);
+-                m_removedTrackers.insert(knownTracker);
+-                return true;
+-            }
+-
+-            m_updatedTrackers.insert(knownTracker);
+-            return false;
+-        }
+-
+-        if (currentTrackers.contains(knownTracker) && !torrentIDs.contains(torrentID))
+-        {
+-            torrentIDs.insert(torrentID);
+-            m_updatedTrackers.insert(knownTracker);
+-            return false;
+-        }
+-
+-        return false;
+-    });
+-
+-    for (const QString &currentTracker : asConst(currentTrackers))
+-    {
+-        if (!m_knownTrackers.contains(currentTracker))
+-        {
+-            m_knownTrackers.insert(currentTracker, {torrentID});
+-            m_updatedTrackers.insert(currentTracker);
+-            m_removedTrackers.remove(currentTracker);
+-        }
+-    }
+-}
+diff --git a/src/webui/api/synccontroller.h b/src/webui/api/synccontroller.h
+index 2123f62..f6ffb98 100644
+--- a/src/webui/api/synccontroller.h
++++ b/src/webui/api/synccontroller.h
+@@ -33,12 +33,18 @@
+ 
+ #include "base/bittorrent/infohash.h"
+ #include "apicontroller.h"
++#include "maindatasyncstore.h"
+ 
+ namespace BitTorrent
+ {
+     class Torrent;
+ }
+ 
++namespace WebUISync
++{
++    class MaindataSyncStore;
++}
++
+ class SyncController : public APIController
+ {
+     Q_OBJECT
+@@ -47,70 +53,17 @@ class SyncController : public APIController
+ public:
+     using APIController::APIController;
+ 
+-    explicit SyncController(IApplication *app, QObject *parent = nullptr);
+-
+-public slots:
+-    void updateFreeDiskSpace(qint64 freeDiskSpace);
++    explicit SyncController(IApplication *app, WebUISync::MaindataSyncStore *maindataSyncStore
++        , QObject *parent = nullptr);
+ 
+ private slots:
+     void maindataAction();
+     void torrentPeersAction();
+ 
+ private:
+-    void makeMaindataSnapshot();
+-    QJsonObject generateMaindataSyncData(int id, bool fullUpdate);
+-
+-    void onCategoryAdded(const QString &categoryName);
+-    void onCategoryRemoved(const QString &categoryName);
+-    void onCategoryOptionsChanged(const QString &categoryName);
+-    void onSubcategoriesSupportChanged();
+-    void onTagAdded(const QString &tag);
+-    void onTagRemoved(const QString &tag);
+-    void onTorrentAdded(BitTorrent::Torrent *torrent);
+-    void onTorrentAboutToBeRemoved(BitTorrent::Torrent *torrent);
+-    void onTorrentCategoryChanged(BitTorrent::Torrent *torrent, const QString &oldCategory);
+-    void onTorrentMetadataReceived(BitTorrent::Torrent *torrent);
+-    void onTorrentPaused(BitTorrent::Torrent *torrent);
+-    void onTorrentResumed(BitTorrent::Torrent *torrent);
+-    void onTorrentSavePathChanged(BitTorrent::Torrent *torrent);
+-    void onTorrentSavingModeChanged(BitTorrent::Torrent *torrent);
+-    void onTorrentTagAdded(BitTorrent::Torrent *torrent, const QString &tag);
+-    void onTorrentTagRemoved(BitTorrent::Torrent *torrent, const QString &tag);
+-    void onTorrentsUpdated(const QVector<BitTorrent::Torrent *> &torrents);
+-    void onTorrentTrackersChanged(BitTorrent::Torrent *torrent);
+-
+-    qint64 m_freeDiskSpace = 0;
++    WebUISync::MaindataSyncStore *m_maindataSyncStore = nullptr;
++    WebUISync::MaindataSessionCursor m_maindataCursor;
+ 
+     QVariantMap m_lastPeersResponse;
+     QVariantMap m_lastAcceptedPeersResponse;
+-
+-    QHash<QString, QSet<BitTorrent::TorrentID>> m_knownTrackers;
+-
+-    QSet<QString> m_updatedCategories;
+-    QSet<QString> m_removedCategories;
+-    QSet<QString> m_addedTags;
+-    QSet<QString> m_removedTags;
+-    QSet<QString> m_updatedTrackers;
+-    QSet<QString> m_removedTrackers;
+-    QSet<BitTorrent::TorrentID> m_updatedTorrents;
+-    QSet<BitTorrent::TorrentID> m_removedTorrents;
+-
+-    struct MaindataSyncBuf
+-    {
+-        QHash<QString, QVariantMap> categories;
+-        QVariantList tags;
+-        QHash<QString, QVariantMap> torrents;
+-        QHash<QString, QStringList> trackers;
+-        QVariantMap serverState;
+-
+-        QStringList removedCategories;
+-        QStringList removedTags;
+-        QStringList removedTorrents;
+-        QStringList removedTrackers;
+-    };
+-
+-    MaindataSyncBuf m_maindataSnapshot;
+-    MaindataSyncBuf m_maindataSyncBuf;
+-    int m_maindataLastSentID = 0;
+-    int m_maindataAcceptedID = -1;
+ };
+diff --git a/src/webui/webapplication.cpp b/src/webui/webapplication.cpp
+index 3127484..3c5137b 100644
+--- a/src/webui/webapplication.cpp
++++ b/src/webui/webapplication.cpp
+@@ -59,6 +59,7 @@
+ #include "api/appcontroller.h"
+ #include "api/authcontroller.h"
+ #include "api/logcontroller.h"
++#include "api/maindatasyncstore.h"
+ #include "api/rsscontroller.h"
+ #include "api/searchcontroller.h"
+ #include "api/synccontroller.h"
+@@ -159,6 +160,7 @@ WebApplication::WebApplication(IApplication *app, QObject *parent)
+     , m_workerThread {new QThread}
+     , m_freeDiskSpaceChecker {new FreeDiskSpaceChecker}
+     , m_freeDiskSpaceCheckingTimer {new QTimer(this)}
++    , m_maindataSyncStore {new WebUISync::MaindataSyncStore(this)}
+ {
+     declarePublicAPI(u"auth/login"_s);
+ 
+@@ -184,6 +186,8 @@ WebApplication::WebApplication(IApplication *app, QObject *parent)
+     m_freeDiskSpaceCheckingTimer->setSingleShot(true);
+     connect(m_freeDiskSpaceCheckingTimer, &QTimer::timeout, m_freeDiskSpaceChecker, &FreeDiskSpaceChecker::check);
+     connect(m_freeDiskSpaceChecker, &FreeDiskSpaceChecker::checked, m_freeDiskSpaceCheckingTimer, qOverload<>(&QTimer::start));
++    connect(m_freeDiskSpaceChecker, &FreeDiskSpaceChecker::checked
++            , m_maindataSyncStore, &WebUISync::MaindataSyncStore::updateFreeDiskSpace);
+     QMetaObject::invokeMethod(m_freeDiskSpaceChecker, &FreeDiskSpaceChecker::check);
+ }
+ 
+@@ -350,7 +354,12 @@ void WebApplication::doProcessRequest()
+     try
+     {
+         const QVariant result = controller->run(action, m_params, data);
+-        switch (result.userType())
++        if (result.userType() == qMetaTypeId<RawAPIResult>())
++        {
++            const RawAPIResult rawResult = result.value<RawAPIResult>();
++            print(rawResult.data, rawResult.contentType);
++        }
++        else switch (result.userType())
+         {
+         case QMetaType::QJsonDocument:
+             print(result.toJsonDocument().toJson(QJsonDocument::Compact), Http::CONTENT_TYPE_JSON);
+@@ -718,9 +727,8 @@ void WebApplication::sessionStart()
+     m_currentSession->registerAPIController<TorrentsController>(u"torrents"_s);
+     m_currentSession->registerAPIController<TransferController>(u"transfer"_s);
+ 
+-    auto *syncController = m_currentSession->registerAPIController<SyncController>(u"sync"_s);
+-    syncController->updateFreeDiskSpace(m_freeDiskSpaceChecker->lastResult());
+-    connect(m_freeDiskSpaceChecker, &FreeDiskSpaceChecker::checked, syncController, &SyncController::updateFreeDiskSpace);
++    m_maindataSyncStore->updateFreeDiskSpace(m_freeDiskSpaceChecker->lastResult());
++    m_currentSession->registerAPIController<SyncController>(u"sync"_s, m_maindataSyncStore);
+ 
+     QNetworkCookie cookie {m_sessionCookieName.toLatin1(), m_currentSession->id().toUtf8()};
+     cookie.setHttpOnly(true);
+diff --git a/src/webui/webapplication.h b/src/webui/webapplication.h
+index 9531358..4a3571b 100644
+--- a/src/webui/webapplication.h
++++ b/src/webui/webapplication.h
+@@ -62,6 +62,11 @@ class AuthController;
+ class FreeDiskSpaceChecker;
+ class WebApplication;
+ 
++namespace WebUISync
++{
++    class MaindataSyncStore;
++}
++
+ class WebSession final : public QObject, public ApplicationComponent, public ISession
+ {
+ public:
+@@ -72,11 +77,11 @@ public:
+     bool hasExpired(qint64 seconds) const;
+     void updateTimestamp();
+ 
+-    template <typename T>
+-    T *registerAPIController(const QString &scope)
++    template <typename T, typename... Args>
++    T *registerAPIController(const QString &scope, Args &&... args)
+     {
+         static_assert(std::is_base_of_v<APIController, T>, "Class should be derived from APIController.");
+-        auto *controller = new T(app(), this);
++        auto *controller = new T(app(), std::forward<Args>(args)..., this);
+         m_apiControllers[scope] = controller;
+         return controller;
+     }
+@@ -254,4 +259,5 @@ private:
+     Utils::Thread::UniquePtr m_workerThread;
+     FreeDiskSpaceChecker *m_freeDiskSpaceChecker = nullptr;
+     QTimer *m_freeDiskSpaceCheckingTimer = nullptr;
++    WebUISync::MaindataSyncStore *m_maindataSyncStore = nullptr;
+ };
+diff --git a/src/webui/www/private/index.html b/src/webui/www/private/index.html
+index 9aa01c0..c35ba7c 100644
+--- a/src/webui/www/private/index.html
++++ b/src/webui/www/private/index.html
+@@ -29,6 +29,7 @@
+     <script src="scripts/progressbar.js?v=${CACHEID}"></script>
+     <script src="scripts/piecesbar.js?v=${CACHEID}"></script>
+     <script src="scripts/file-tree.js?v=${CACHEID}"></script>
++    <script src="scripts/torrent-list-state.js?v=${CACHEID}"></script>
+     <script src="scripts/dynamicTable.js?locale=${LANG}&v=${CACHEID}"></script>
+     <script src="scripts/rename-files.js?v=${CACHEID}"></script>
+     <script src="scripts/client.js?locale=${LANG}&v=${CACHEID}"></script>
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index 17d3e88..5c76577 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -64,6 +64,7 @@ window.qBittorrent.DynamicTable = (function() {
+             return 1;
+         return 0;
+     };
++    const TorrentListState = window.qBittorrent.TorrentListState;
+ 
+     let DynamicTableHeaderContextMenuClass = null;
+     let ProgressColumnWidth = -1;
+@@ -82,6 +83,18 @@ window.qBittorrent.DynamicTable = (function() {
+             this.selectedRows = [];
+             this.columns = [];
+             this.contextMenu = contextMenu;
++            this.logicalRowOrderEnabled = false;
++            this.logicalRows = [];
++            this.rowOrderState = null;
++            this.virtualTableRenderingEnabled = false;
++            this.virtualRowHeight = 0;
++            this.virtualRowHeightFallback = 26;
++            this.virtualOverscan = 8;
++            this.virtualWindowRange = null;
++            this.virtualTopSpacerRow = null;
++            this.virtualBottomSpacerRow = null;
++            this.virtualReusableRows = [];
++            this.virtualRefreshFrameId = null;
+             this.sortedColumn = LocalPreferences.get('sorted_column_' + this.dynamicTableDivId, 0);
+             this.reverseSort = LocalPreferences.get('reverse_sort_' + this.dynamicTableDivId, '0');
+             this.initColumns();
+@@ -96,6 +109,7 @@ window.qBittorrent.DynamicTable = (function() {
+         setupCommonEvents: function() {
+             const scrollFn = function() {
+                 $(this.dynamicTableFixedHeaderDivId).getElements('table')[0].style.left = -$(this.dynamicTableDivId).scrollLeft + 'px';
++                this.scheduleVirtualTableRefresh();
+             }.bind(this);
+ 
+             $(this.dynamicTableDivId).addEvent('scroll', scrollFn);
+@@ -118,6 +132,7 @@ window.qBittorrent.DynamicTable = (function() {
+                         $(this.dynamicTableDivId).style.height = h + 'px';
+                     }
+ 
++                    this.scheduleVirtualTableRefresh();
+                     this.lastPanelHeight = panel.getBoundingClientRect().height;
+                 }.bind(this);
+ 
+@@ -489,7 +504,7 @@ window.qBittorrent.DynamicTable = (function() {
+             const visible = ((this.columns[pos].visible != '0') && !this.columns[pos].force_hide);
+             const ths = this.hiddenTableHeader.getElements('th');
+             const fths = this.fixedTableHeader.getElements('th');
+-            const trs = this.tableBody.getElements('tr');
++            const trs = this.getDataRows();
+             const style = 'width: ' + this.columns[pos].width + 'px;' + this.columns[pos].style;
+ 
+             ths[pos].setAttribute('style', style);
+@@ -556,6 +571,350 @@ window.qBittorrent.DynamicTable = (function() {
+             }
+         },
+ 
++        hasLogicalRowOrder: function() {
++            return (this.logicalRowOrderEnabled && !!TorrentListState && !!this.rowOrderState);
++        },
++
++        rebuildRowOrderState: function(rows) {
++            this.logicalRows = rows;
++
++            if (!this.logicalRowOrderEnabled || !TorrentListState) {
++                this.rowOrderState = null;
++                return;
++            }
++
++            this.rowOrderState = TorrentListState.buildRowOrderState(rows);
++        },
++
++        getDataRows: function() {
++            if (!this.tableBody)
++                return [];
++
++            return this.tableBody.getElements('tr').filter(tr => tr.rowId !== undefined);
++        },
++
++        hasVirtualTableRendering: function() {
++            return (this.virtualTableRenderingEnabled && !!TorrentListState && !!this.logicalRows);
++        },
++
++        getTableViewportHeight: function() {
++            const tableDiv = $(this.dynamicTableDivId);
++            if (!tableDiv)
++                return 0;
++
++            return (tableDiv.clientHeight || tableDiv.offsetHeight || 0);
++        },
++
++        measureVirtualRowHeight: function() {
++            if (!this.tableBody)
++                return 0;
++
++            const rows = this.getDataRows();
++            if (rows.length === 0)
++                return 0;
++
++            return (rows[0].offsetHeight || rows[0].getSize().y || 0);
++        },
++
++        getVirtualRowHeight: function() {
++            if (this.virtualRowHeight > 0)
++                return this.virtualRowHeight;
++
++            const measuredHeight = this.measureVirtualRowHeight();
++            if (measuredHeight > 0) {
++                this.virtualRowHeight = measuredHeight;
++                return measuredHeight;
++            }
++
++            return this.virtualRowHeightFallback;
++        },
++
++        createVirtualSpacerRow: function(className) {
++            const tr = new Element('tr');
++            const td = new Element('td');
++            const spacer = new Element('div');
++
++            tr.addClass(className);
++            td.setProperty('colspan', this.columns.length);
++            td.setStyles({
++                padding: 0,
++                border: 0,
++                height: 0
++            });
++            spacer.setStyles({
++                height: 0,
++                margin: 0,
++                padding: 0
++            });
++
++            td.adopt(spacer);
++            tr.adopt(td);
++            tr._virtualSpacerCell = td;
++            tr._virtualSpacerContent = spacer;
++
++            return tr;
++        },
++
++        isTableBodyChild: function(row) {
++            if (!row)
++                return false;
++
++            return ((row.parentNode === this.tableBody) || (row.parent === this.tableBody));
++        },
++
++        ensureVirtualSpacerRows: function() {
++            if (!this.virtualTopSpacerRow)
++                this.virtualTopSpacerRow = this.createVirtualSpacerRow('virtualTableTopSpacer');
++
++            if (!this.virtualBottomSpacerRow)
++                this.virtualBottomSpacerRow = this.createVirtualSpacerRow('virtualTableBottomSpacer');
++
++            if (!this.isTableBodyChild(this.virtualBottomSpacerRow))
++                this.virtualBottomSpacerRow.inject(this.tableBody);
++
++            if (!this.isTableBodyChild(this.virtualTopSpacerRow))
++                this.virtualTopSpacerRow.inject(this.virtualBottomSpacerRow, 'before');
++        },
++
++        updateVirtualSpacerHeight: function(spacerRow, height) {
++            if (!spacerRow)
++                return;
++
++            const normalizedHeight = Math.max(0, height);
++
++            spacerRow._virtualSpacerCell.setProperty('colspan', this.columns.length);
++            spacerRow._virtualSpacerContent.setStyle('height', normalizedHeight + 'px');
++            spacerRow.setStyle('display', (normalizedHeight > 0) ? '' : 'none');
++        },
++
++        scheduleVirtualTableRefresh: function() {
++            if (!this.hasVirtualTableRendering())
++                return;
++
++            if (this.virtualRefreshFrameId !== null)
++                return;
++
++            const refresh = function() {
++                this.virtualRefreshFrameId = null;
++                this.refreshVirtualTableWindow();
++            }.bind(this);
++
++            if (typeof window.requestAnimationFrame === 'function')
++                this.virtualRefreshFrameId = window.requestAnimationFrame(refresh);
++            else
++                this.virtualRefreshFrameId = setTimeout(refresh, 0);
++        },
++
++        assignRowIdentity: function(tr, rowId) {
++            tr.setProperty("data-row-id", rowId);
++            tr['rowId'] = rowId;
++        },
++
++        createRowElement: function(rowId) {
++            const tr = new Element('tr');
++            // set tabindex so element receives keydown events
++            // more info: https://developer.mozilla.org/en-US/docs/Web/API/Element/keydown_event
++            tr.setProperty("tabindex", "-1");
++            this.assignRowIdentity(tr, rowId);
++
++            tr._this = this;
++            tr.addEvent('contextmenu', function(e) {
++                if (!this._this.isRowSelected(this.rowId)) {
++                    this._this.deselectAll();
++                    this._this.selectRow(this.rowId);
++                }
++                return true;
++            });
++            tr.addEvent('click', function(e) {
++                e.stop();
++                if (e.control || e.meta) {
++                    // CTRL/CMD ⌘ key was pressed
++                    if (this._this.isRowSelected(this.rowId))
++                        this._this.deselectRow(this.rowId);
++                    else
++                        this._this.selectRow(this.rowId);
++                }
++                else if (e.shift && (this._this.selectedRows.length == 1)) {
++                    // Shift key was pressed
++                    this._this.selectRows(this._this.getSelectedRowId(), this.rowId);
++                }
++                else {
++                    // Simple selection
++                    this._this.deselectAll();
++                    this._this.selectRow(this.rowId);
++                }
++                return false;
++            });
++            tr.addEvent('touchstart', function(e) {
++                if (!this._this.isRowSelected(this.rowId)) {
++                    this._this.deselectAll();
++                    this._this.selectRow(this.rowId);
++                }
++                return false;
++            });
++            tr.addEvent('keydown', function(event) {
++                switch (event.key) {
++                    case "up":
++                        this._this.selectPreviousRow();
++                        return false;
++                    case "down":
++                        this._this.selectNextRow();
++                        return false;
++                }
++            });
++
++            this.setupTr(tr);
++
++            for (let k = 0; k < this.columns.length; ++k) {
++                const td = new Element('td');
++                if ((this.columns[k].visible == '0') || this.columns[k].force_hide)
++                    td.addClass('invisible');
++                td.injectInside(tr);
++            }
++
++            if (this.contextMenu)
++                this.contextMenu.addTarget(tr);
++
++            return tr;
++        },
++
++        renderVirtualTable: function(rows, fullUpdate) {
++            this.ensureVirtualSpacerRows();
++
++            const tableDiv = $(this.dynamicTableDivId);
++            const rowHeight = this.getVirtualRowHeight();
++            const windowRange = TorrentListState.calculateWindowRange({
++                totalRows: rows.length,
++                rowHeight,
++                scrollTop: tableDiv.scrollTop,
++                viewportHeight: this.getTableViewportHeight(),
++                overscan: this.virtualOverscan
++            });
++            const mountedRows = this.getDataRows();
++            const mountedById = Object.create(null);
++            const visibleRowIds = Object.create(null);
++
++            this.virtualWindowRange = windowRange;
++
++            for (let rowPos = windowRange.startIndex; rowPos <= windowRange.endIndex; ++rowPos)
++                visibleRowIds[rows[rowPos].rowId] = true;
++
++            for (let i = 0; i < mountedRows.length; ++i) {
++                const tr = mountedRows[i];
++                if (!visibleRowIds[tr.rowId]) {
++                    tr.dispose();
++                    this.virtualReusableRows.push(tr);
++                    continue;
++                }
++
++                mountedById[tr.rowId] = tr;
++            }
++
++            let nextSibling = this.virtualBottomSpacerRow;
++            for (let rowPos = windowRange.endIndex; rowPos >= windowRange.startIndex; --rowPos) {
++                const row = rows[rowPos];
++                const rowId = row.rowId;
++                let tr = mountedById[rowId];
++
++                if (!tr) {
++                    if (this.virtualReusableRows.length > 0) {
++                        tr = this.virtualReusableRows.pop();
++                        this.assignRowIdentity(tr, rowId);
++                    }
++                    else {
++                        tr = this.createRowElement(rowId);
++                    }
++
++                    tr.inject(nextSibling, 'before');
++                    this.updateRow(tr, true);
++                }
++                else {
++                    tr.inject(nextSibling, 'before');
++                    this.updateRow(tr, fullUpdate);
++                }
++
++                nextSibling = tr;
++            }
++
++            this.updateVirtualSpacerHeight(this.virtualTopSpacerRow, windowRange.topSpacerHeight);
++            this.updateVirtualSpacerHeight(this.virtualBottomSpacerRow, windowRange.bottomSpacerHeight);
++            this.setRowClass();
++
++            const measuredRowHeight = this.measureVirtualRowHeight();
++            if ((measuredRowHeight > 0) && (measuredRowHeight !== this.virtualRowHeight)) {
++                this.virtualRowHeight = measuredRowHeight;
++
++                const measuredWindowRange = TorrentListState.calculateWindowRange({
++                    totalRows: rows.length,
++                    rowHeight: measuredRowHeight,
++                    scrollTop: tableDiv.scrollTop,
++                    viewportHeight: this.getTableViewportHeight(),
++                    overscan: this.virtualOverscan
++                });
++
++                if ((measuredWindowRange.startIndex !== windowRange.startIndex)
++                    || (measuredWindowRange.endIndex !== windowRange.endIndex)
++                    || (measuredWindowRange.topSpacerHeight !== windowRange.topSpacerHeight)
++                    || (measuredWindowRange.bottomSpacerHeight !== windowRange.bottomSpacerHeight)) {
++                    this.renderVirtualTable(rows, fullUpdate);
++                }
++            }
++        },
++
++        refreshVirtualTableWindow: function(fullUpdate = false) {
++            if (!this.hasVirtualTableRendering())
++                return;
++
++            this.renderVirtualTable(this.logicalRows, fullUpdate);
++        },
++
++        ensureRowIsVisible: function(rowId) {
++            const tr = this.getTrByRowId(rowId);
++            if (!tr) {
++                if (!this.hasVirtualTableRendering() || !this.rowOrderState)
++                    return;
++
++                const rowIndex = this.rowOrderState.rowIndexById[`${rowId}`];
++                if (rowIndex === undefined)
++                    return;
++
++                const tableDiv = $(this.dynamicTableDivId);
++                const rowHeight = this.getVirtualRowHeight();
++                const rowTop = rowIndex * rowHeight;
++                const rowBottom = rowTop + rowHeight;
++                const currentScrollTop = tableDiv.scrollTop;
++                const viewportHeight = this.getTableViewportHeight();
++                let nextScrollTop = currentScrollTop;
++
++                if (rowTop < currentScrollTop)
++                    nextScrollTop = rowTop;
++                else if (rowBottom > (currentScrollTop + viewportHeight))
++                    nextScrollTop = Math.max(0, rowBottom - viewportHeight);
++
++                if (nextScrollTop !== currentScrollTop) {
++                    tableDiv.scrollTop = nextScrollTop;
++                    this.refreshVirtualTableWindow();
++                }
++                return;
++            }
++
++            if (typeof tr.scrollIntoView !== 'function')
++                return;
++
++            try {
++                tr.scrollIntoView({block: 'nearest'});
++            }
++            catch (error) {
++                tr.scrollIntoView(false);
++            }
++        },
++
++        focusRow: function(rowId) {
++            const tr = this.getTrByRowId(rowId);
++            if (tr && (typeof tr.focus === 'function'))
++                tr.focus();
++        },
++
+         getSelectedRowId: function() {
+             if (this.selectedRows.length > 0)
+                 return this.selectedRows[0];
+@@ -570,7 +929,7 @@ window.qBittorrent.DynamicTable = (function() {
+             if (!MUI.ieLegacySupport)
+                 return;
+ 
+-            const trs = this.tableBody.getElements('tr');
++            const trs = this.getDataRows();
+             trs.each(function(el, i) {
+                 if (i % 2) {
+                     el.addClass('alt');
+@@ -584,7 +943,14 @@ window.qBittorrent.DynamicTable = (function() {
+         selectAll: function() {
+             this.deselectAll();
+ 
+-            const trs = this.tableBody.getElements('tr');
++            if (this.hasLogicalRowOrder()) {
++                this.selectedRows = this.rowOrderState.rowIds.slice();
++                this.setRowClass();
++                this.onSelectedRowChanged();
++                return;
++            }
++
++            const trs = this.getDataRows();
+             for (let i = 0; i < trs.length; ++i) {
+                 const tr = trs[i];
+                 this.selectedRows.push(tr.rowId);
+@@ -616,9 +982,16 @@ window.qBittorrent.DynamicTable = (function() {
+                 return;
+             }
+ 
++            if (this.hasLogicalRowOrder()) {
++                this.selectedRows = TorrentListState.getRangeSelection(this.rowOrderState, rowId1, rowId2);
++                this.setRowClass();
++                this.onSelectedRowChanged();
++                return;
++            }
++
+             let select = false;
+             const that = this;
+-            this.tableBody.getElements('tr').each(function(tr) {
++            this.getDataRows().each(function(tr) {
+                 if ((tr.rowId == rowId1) || (tr.rowId == rowId2)) {
+                     select = !select;
+                     that.selectedRows.push(tr.rowId);
+@@ -634,7 +1007,7 @@ window.qBittorrent.DynamicTable = (function() {
+         reselectRows: function(rowIds) {
+             this.deselectAll();
+             this.selectedRows = rowIds.slice();
+-            this.tableBody.getElements('tr').each(function(tr) {
++            this.getDataRows().each(function(tr) {
+                 if (rowIds.indexOf(tr.rowId) > -1)
+                     tr.addClass('selected');
+             });
+@@ -642,7 +1015,7 @@ window.qBittorrent.DynamicTable = (function() {
+ 
+         setRowClass: function() {
+             const that = this;
+-            this.tableBody.getElements('tr').each(function(tr) {
++            this.getDataRows().each(function(tr) {
+                 if (that.isRowSelected(tr.rowId))
+                     tr.addClass('selected');
+                 else
+@@ -694,7 +1067,7 @@ window.qBittorrent.DynamicTable = (function() {
+         },
+ 
+         getTrByRowId: function(rowId) {
+-            const trs = this.tableBody.getElements('tr');
++            const trs = this.getDataRows();
+             for (let i = 0; i < trs.length; ++i)
+                 if (trs[i].rowId == rowId)
+                     return trs[i];
+@@ -703,6 +1076,7 @@ window.qBittorrent.DynamicTable = (function() {
+ 
+         updateTable: function(fullUpdate = false) {
+             const rows = this.getFilteredAndSortedRows();
++            this.rebuildRowOrderState(rows);
+ 
+             for (let i = 0; i < this.selectedRows.length; ++i)
+                 if (!(this.selectedRows[i] in rows)) {
+@@ -710,7 +1084,12 @@ window.qBittorrent.DynamicTable = (function() {
+                     --i;
+                 }
+ 
+-            const trs = this.tableBody.getElements('tr');
++            if (this.hasVirtualTableRendering()) {
++                this.refreshVirtualTableWindow(fullUpdate);
++                return;
++            }
++
++            const trs = this.getDataRows();
+ 
+             for (let rowPos = 0; rowPos < rows.length; ++rowPos) {
+                 const rowId = rows[rowPos]['rowId'];
+@@ -729,69 +1108,7 @@ window.qBittorrent.DynamicTable = (function() {
+                 if (tr_found) // row already exists in the table
+                     this.updateRow(trs[rowPos], fullUpdate);
+                 else { // else create a new row in the table
+-                    const tr = new Element('tr');
+-                    // set tabindex so element receives keydown events
+-                    // more info: https://developer.mozilla.org/en-US/docs/Web/API/Element/keydown_event
+-                    tr.setProperty("tabindex", "-1");
+-
+-                    const rowId = rows[rowPos]['rowId'];
+-                    tr.setProperty("data-row-id", rowId);
+-                    tr['rowId'] = rowId;
+-
+-                    tr._this = this;
+-                    tr.addEvent('contextmenu', function(e) {
+-                        if (!this._this.isRowSelected(this.rowId)) {
+-                            this._this.deselectAll();
+-                            this._this.selectRow(this.rowId);
+-                        }
+-                        return true;
+-                    });
+-                    tr.addEvent('click', function(e) {
+-                        e.stop();
+-                        if (e.control || e.meta) {
+-                            // CTRL/CMD ⌘ key was pressed
+-                            if (this._this.isRowSelected(this.rowId))
+-                                this._this.deselectRow(this.rowId);
+-                            else
+-                                this._this.selectRow(this.rowId);
+-                        }
+-                        else if (e.shift && (this._this.selectedRows.length == 1)) {
+-                            // Shift key was pressed
+-                            this._this.selectRows(this._this.getSelectedRowId(), this.rowId);
+-                        }
+-                        else {
+-                            // Simple selection
+-                            this._this.deselectAll();
+-                            this._this.selectRow(this.rowId);
+-                        }
+-                        return false;
+-                    });
+-                    tr.addEvent('touchstart', function(e) {
+-                        if (!this._this.isRowSelected(this.rowId)) {
+-                            this._this.deselectAll();
+-                            this._this.selectRow(this.rowId);
+-                        }
+-                        return false;
+-                    });
+-                    tr.addEvent('keydown', function(event) {
+-                        switch (event.key) {
+-                            case "up":
+-                                this._this.selectPreviousRow();
+-                                return false;
+-                            case "down":
+-                                this._this.selectNextRow();
+-                                return false;
+-                        }
+-                    });
+-
+-                    this.setupTr(tr);
+-
+-                    for (let k = 0; k < this.columns.length; ++k) {
+-                        const td = new Element('td');
+-                        if ((this.columns[k].visible == '0') || this.columns[k].force_hide)
+-                            td.addClass('invisible');
+-                        td.injectInside(tr);
+-                    }
++                    const tr = this.createRowElement(rowId);
+ 
+                     // Insert
+                     if (rowPos >= trs.length) {
+@@ -803,10 +1120,6 @@ window.qBittorrent.DynamicTable = (function() {
+                         trs.splice(rowPos, 0, tr);
+                     }
+ 
+-                    // Update context menu
+-                    if (this.contextMenu)
+-                        this.contextMenu.addTarget(tr);
+-
+                     this.updateRow(tr, true);
+                 }
+             }
+@@ -835,21 +1148,29 @@ window.qBittorrent.DynamicTable = (function() {
+         removeRow: function(rowId) {
+             this.selectedRows.erase(rowId);
+             const tr = this.getTrByRowId(rowId);
+-            if (tr !== null) {
++            if (tr !== null)
+                 tr.destroy();
++
++            const existed = this.rows.has(rowId);
++            if (existed)
+                 this.rows.erase(rowId);
+-                return true;
+-            }
+-            return false;
++
++            return existed;
+         },
+ 
+         clear: function() {
+             this.deselectAll();
+             this.rows.empty();
+-            const trs = this.tableBody.getElements('tr');
+-            while (trs.length > 0) {
++            this.logicalRows = [];
++            this.rowOrderState = null;
++            this.virtualWindowRange = null;
++            this.virtualTopSpacerRow = null;
++            this.virtualBottomSpacerRow = null;
++            while (this.virtualReusableRows.length > 0)
++                this.virtualReusableRows.pop().destroy();
++            const trs = this.tableBody.getChildren();
++            while (trs.length > 0)
+                 trs.pop().destroy();
+-            }
+         },
+ 
+         selectedRowsIds: function() {
+@@ -861,6 +1182,17 @@ window.qBittorrent.DynamicTable = (function() {
+         },
+ 
+         selectNextRow: function() {
++            if (this.hasLogicalRowOrder()) {
++                const nextRowId = TorrentListState.getAdjacentRowId(this.rowOrderState, this.getSelectedRowId(), 1);
++                if (nextRowId !== null) {
++                    this.deselectAll();
++                    this.selectRow(nextRowId);
++                    this.ensureRowIsVisible(nextRowId);
++                    this.focusRow(nextRowId);
++                }
++                return;
++            }
++
+             const visibleRows = $(this.dynamicTableDivId).getElements("tbody tr").filter(e => e.getStyle("display") !== "none");
+             const selectedRowId = this.getSelectedRowId();
+ 
+@@ -879,10 +1211,23 @@ window.qBittorrent.DynamicTable = (function() {
+ 
+                 const newRow = visibleRows[selectedIndex + 1];
+                 this.selectRow(newRow.getProperty("data-row-id"));
++                if (typeof newRow.focus === 'function')
++                    newRow.focus();
+             }
+         },
+ 
+         selectPreviousRow: function() {
++            if (this.hasLogicalRowOrder()) {
++                const previousRowId = TorrentListState.getAdjacentRowId(this.rowOrderState, this.getSelectedRowId(), -1);
++                if (previousRowId !== null) {
++                    this.deselectAll();
++                    this.selectRow(previousRowId);
++                    this.ensureRowIsVisible(previousRowId);
++                    this.focusRow(previousRowId);
++                }
++                return;
++            }
++
+             const visibleRows = $(this.dynamicTableDivId).getElements("tbody tr").filter(e => e.getStyle("display") !== "none");
+             const selectedRowId = this.getSelectedRowId();
+ 
+@@ -901,6 +1246,8 @@ window.qBittorrent.DynamicTable = (function() {
+ 
+                 const newRow = visibleRows[selectedIndex - 1];
+                 this.selectRow(newRow.getProperty("data-row-id"));
++                if (typeof newRow.focus === 'function')
++                    newRow.focus();
+             }
+         },
+     });
+@@ -1160,7 +1507,7 @@ window.qBittorrent.DynamicTable = (function() {
+ 
+             this.columns['progress'].onResize = function(columnName) {
+                 const pos = this.getColumnPos(columnName);
+-                const trs = this.tableBody.getElements('tr');
++                const trs = this.getDataRows();
+                 ProgressColumnWidth = -1;
+                 for (let i = 0; i < trs.length; ++i) {
+                     const td = trs[i].getElements('td')[pos];
+diff --git a/src/webui/www/private/scripts/torrent-list-state.js b/src/webui/www/private/scripts/torrent-list-state.js
+new file mode 100644
+index 0000000..39771ad
+--- /dev/null
++++ b/src/webui/www/private/scripts/torrent-list-state.js
+@@ -0,0 +1,119 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ */
++
++(function(root, factory) {
++    const api = factory();
++
++    if ((typeof module === "object") && module.exports)
++        module.exports = api;
++
++    if (typeof window !== "undefined") {
++        window.qBittorrent ??= {};
++        window.qBittorrent.TorrentListState = api;
++    }
++})(typeof globalThis !== "undefined" ? globalThis : this, function() {
++    const normalizeInteger = (value, fallback = 0) => {
++        const normalized = Number.parseInt(value, 10);
++        return Number.isFinite(normalized) ? normalized : fallback;
++    };
++
++    const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
++
++    const buildRowOrderState = (rows) => {
++        const rowIds = [];
++        const rowIndexById = Object.create(null);
++        const rowsById = Object.create(null);
++
++        for (let index = 0; index < rows.length; ++index) {
++            const row = rows[index];
++            const rowId = `${row.rowId}`;
++
++            rowIds.push(rowId);
++            rowIndexById[rowId] = index;
++            rowsById[rowId] = row;
++        }
++
++        return {
++            rowIds,
++            rowIndexById,
++            rowsById
++        };
++    };
++
++    const getRangeSelection = (state, rowId1, rowId2) => {
++        const startIndex = state.rowIndexById[`${rowId1}`];
++        const endIndex = state.rowIndexById[`${rowId2}`];
++
++        if ((startIndex === undefined) || (endIndex === undefined))
++            return [];
++
++        const lowerIndex = Math.min(startIndex, endIndex);
++        const upperIndex = Math.max(startIndex, endIndex);
++
++        return state.rowIds.slice(lowerIndex, upperIndex + 1);
++    };
++
++    const getAdjacentRowId = (state, currentRowId, delta) => {
++        const normalizedDelta = Math.sign(normalizeInteger(delta));
++        if (normalizedDelta === 0)
++            return null;
++
++        const currentIndex = state.rowIndexById[`${currentRowId}`];
++
++        if (currentIndex === undefined) {
++            if (normalizedDelta > 0)
++                return state.rowIds[0] ?? null;
++            return null;
++        }
++
++        const nextIndex = currentIndex + normalizedDelta;
++        if ((nextIndex < 0) || (nextIndex >= state.rowIds.length))
++            return null;
++
++        return state.rowIds[nextIndex];
++    };
++
++    const calculateWindowRange = ({totalRows, rowHeight, scrollTop, viewportHeight, overscan}) => {
++        const safeTotalRows = Math.max(0, normalizeInteger(totalRows));
++        const safeRowHeight = Math.max(1, normalizeInteger(rowHeight, 1));
++        const safeScrollTop = Math.max(0, normalizeInteger(scrollTop));
++        const safeViewportHeight = Math.max(0, normalizeInteger(viewportHeight));
++        const safeOverscan = Math.max(0, normalizeInteger(overscan));
++
++        if (safeTotalRows === 0) {
++            return {
++                startIndex: 0,
++                endIndex: -1,
++                topSpacerHeight: 0,
++                bottomSpacerHeight: 0
++            };
++        }
++
++        const firstVisibleIndex = clamp(Math.floor(safeScrollTop / safeRowHeight), 0, safeTotalRows - 1);
++        const visibleRowCount = Math.max(1, Math.ceil(safeViewportHeight / safeRowHeight));
++        const lastVisibleIndex = clamp(firstVisibleIndex + visibleRowCount - 1, firstVisibleIndex, safeTotalRows - 1);
++        const startIndex = Math.max(0, firstVisibleIndex - safeOverscan);
++        const endIndex = Math.min(safeTotalRows - 1, lastVisibleIndex + safeOverscan);
++
++        return {
++            startIndex,
++            endIndex,
++            topSpacerHeight: startIndex * safeRowHeight,
++            bottomSpacerHeight: Math.max(0, (safeTotalRows - endIndex - 1) * safeRowHeight)
++        };
++    };
++
++    return {
++        buildRowOrderState,
++        getRangeSelection,
++        getAdjacentRowId,
++        calculateWindowRange
++    };
++});
+diff --git a/src/webui/www/private/views/transferlist.html b/src/webui/www/private/views/transferlist.html
+index e6978c6..adda161 100644
+--- a/src/webui/www/private/views/transferlist.html
++++ b/src/webui/www/private/views/transferlist.html
+@@ -113,6 +113,8 @@
+         });
+ 
+         torrentsTable.setup('torrentsTableDiv', 'torrentsTableFixedHeaderDiv', contextMenu);
++        torrentsTable.logicalRowOrderEnabled = true;
++        torrentsTable.virtualTableRenderingEnabled = true;
+ 
+         return exports();
+     })();
+diff --git a/src/webui/www/webui.qrc b/src/webui/www/webui.qrc
+index ba48934..08e436f 100644
+--- a/src/webui/www/webui.qrc
++++ b/src/webui/www/webui.qrc
+@@ -379,6 +379,7 @@
+         <file>private/rename_rule.html</file>
+         <file>private/scripts/client.js</file>
+         <file>private/scripts/contextmenu.js</file>
++        <file>private/scripts/torrent-list-state.js</file>
+         <file>private/scripts/download.js</file>
+         <file>private/scripts/dynamicTable.js</file>
+         <file>private/scripts/file-tree.js</file>
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index bf358c1..1915886 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -13,9 +13,11 @@ set(testFiles
+     testalgorithm.cpp
+     testbittorrenttrackerentry.cpp
+     testglobal.cpp
++    testhttpresponsegenerator.cpp
+     testorderedset.cpp
+     testpath.cpp
+     testpreferences.cpp
++    testwebuimaindatasync.cpp
+     testutilscompare.cpp
+     testutilsbytearray.cpp
+     testutilsgzip.cpp
+@@ -29,6 +31,9 @@ foreach(testFile ${testFiles})
+ 
+     add_executable("${testFilename}" "${testFile}")
+     target_link_libraries("${testFilename}" PRIVATE Qt::Test qbt_base)
++    if ((testFilename STREQUAL "testwebuimaindatasync") AND TARGET qbt_webui)
++        target_link_libraries("${testFilename}" PRIVATE qbt_webui)
++    endif()
+     add_test(NAME "${testFilename}" COMMAND "${testFilename}")
+ 
+     add_dependencies(check "${testFilename}")
+diff --git a/test/testhttpresponsegenerator.cpp b/test/testhttpresponsegenerator.cpp
+new file mode 100644
+index 0000000..95f3832
+--- /dev/null
++++ b/test/testhttpresponsegenerator.cpp
+@@ -0,0 +1,89 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include <QTest>
++
++#include "base/global.h"
++#include "base/http/responsebuilder.h"
++#include "base/http/responsegenerator.h"
++#include "base/http/types.h"
++
++class TestHttpResponseGenerator final : public QObject
++{
++    Q_OBJECT
++    Q_DISABLE_COPY_MOVE(TestHttpResponseGenerator)
++
++public:
++    TestHttpResponseGenerator() = default;
++
++private slots:
++    void responseBuilderConcatenatesMultiplePrintCalls() const
++    {
++        Http::ResponseBuilder builder;
++        builder.print(QByteArrayLiteral("alpha"), Http::CONTENT_TYPE_TXT);
++        builder.print(QByteArrayLiteral("beta"), Http::CONTENT_TYPE_TXT);
++
++        const Http::Response response = builder.response();
++        QCOMPARE(response.content, QByteArrayLiteral("alphabeta"));
++        QCOMPARE(response.headers.value(Http::HEADER_CONTENT_TYPE), Http::CONTENT_TYPE_TXT);
++    }
++
++    void responseHeadersExcludeBodyAfterPreparation() const
++    {
++        Http::Response response;
++        response.headers[Http::HEADER_CONTENT_TYPE] = Http::CONTENT_TYPE_JSON;
++        response.content = QByteArrayLiteral("{\"rid\":1}");
++
++        Http::prepareResponse(response);
++        const QByteArray headers = Http::responseHeadersToByteArray(response);
++
++        QVERIFY(headers.endsWith(QByteArrayLiteral("\r\n\r\n")));
++        QVERIFY(headers.contains(QByteArrayLiteral("content-length: 9\r\n")));
++        QVERIFY(headers.contains(QByteArrayLiteral("content-type: application/json\r\n")));
++        QVERIFY(headers.contains(QByteArrayLiteral("date: ")));
++        QVERIFY(!headers.contains(response.content));
++        QCOMPARE(response.content, QByteArrayLiteral("{\"rid\":1}"));
++    }
++
++    void toByteArrayMatchesPreparedHeadersPlusBody() const
++    {
++        Http::Response response;
++        response.headers[Http::HEADER_CONTENT_TYPE] = Http::CONTENT_TYPE_TXT;
++        response.content = QByteArrayLiteral("payload");
++
++        Http::Response prepared = response;
++        Http::prepareResponse(prepared);
++
++        const QByteArray headerBytes = Http::responseHeadersToByteArray(prepared);
++        const QByteArray combined = headerBytes + prepared.content;
++        QCOMPARE(Http::toByteArray(response), combined);
++    }
++};
++
++QTEST_APPLESS_MAIN(TestHttpResponseGenerator)
++#include "testhttpresponsegenerator.moc"
+diff --git a/test/testwebuimaindatasync.cpp b/test/testwebuimaindatasync.cpp
+new file mode 100644
+index 0000000..f0196d6
+--- /dev/null
++++ b/test/testwebuimaindatasync.cpp
+@@ -0,0 +1,266 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include <QJsonArray>
++#include <QJsonObject>
++#include <QTest>
++
++#include "base/global.h"
++#include "webui/api/maindatasyncstore.h"
++
++namespace
++{
++    WebUISync::MaindataSyncData makeBaseMaindata()
++    {
++        WebUISync::MaindataSyncData data;
++        data.categories.insert(u"alpha"_s, {{u"name"_s, u"alpha"_s}, {u"savePath"_s, u"/alpha"_s}});
++        data.tags = {u"tag1"_s};
++        data.torrents.insert(u"hash1"_s, {{u"name"_s, u"Ubuntu"_s}, {u"progress"_s, 50}});
++        data.trackers.insert(u"udp://tracker-a"_s, {u"hash1"_s});
++        data.serverState = {{u"refresh_interval"_s, 1500}};
++        return data;
++    }
++
++    WebUISync::MaindataSyncData makeRevisionTwoDelta()
++    {
++        WebUISync::MaindataSyncData data;
++        data.categories.insert(u"beta"_s, {{u"name"_s, u"beta"_s}, {u"savePath"_s, u"/beta"_s}});
++        data.removedCategories = QStringList {u"alpha"_s};
++        data.tags = {u"tag2"_s};
++        data.removedTags = QStringList {u"tag1"_s};
++        data.torrents.insert(u"hash1"_s, {{u"progress"_s, 75}});
++        data.trackers.insert(u"udp://tracker-b"_s, {u"hash1"_s});
++        data.removedTrackers = QStringList {u"udp://tracker-a"_s};
++        data.serverState = {{u"queueing"_s, true}};
++        return data;
++    }
++}
++
++class TestWebUIMaindataSync final : public QObject
++{
++    Q_OBJECT
++    Q_DISABLE_COPY_MOVE(TestWebUIMaindataSync)
++
++public:
++    TestWebUIMaindataSync() = default;
++
++private slots:
++    void firstRequestForcesFullUpdateAndStartsRidSequence() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++
++        const WebUISync::MaindataSyncPlan plan = WebUISync::planMaindataSync(cursor, 0, 7, 1);
++
++        QVERIFY(plan.fullUpdate);
++        QCOMPARE(plan.baseRevision, 0);
++        QCOMPARE(plan.targetRevision, 7);
++        QCOMPARE(plan.responseRid, 1);
++        QCOMPARE(cursor.acceptedRid, 0);
++        QCOMPARE(cursor.acceptedRevision, 0);
++        QCOMPARE(cursor.lastSentRid, 1);
++        QCOMPARE(cursor.lastSentRevision, 7);
++    }
++
++    void acknowledgedRidAdvancesAcceptedRevisionAndUsesIncrementalSync() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++
++        const WebUISync::MaindataSyncPlan firstPlan = WebUISync::planMaindataSync(cursor, 0, 4, 1);
++        QVERIFY(firstPlan.fullUpdate);
++
++        const WebUISync::MaindataSyncPlan secondPlan = WebUISync::planMaindataSync(cursor, 1, 9, 1);
++
++        QVERIFY(!secondPlan.fullUpdate);
++        QCOMPARE(secondPlan.baseRevision, 4);
++        QCOMPARE(secondPlan.targetRevision, 9);
++        QCOMPARE(secondPlan.responseRid, 2);
++        QCOMPARE(cursor.acceptedRid, 1);
++        QCOMPARE(cursor.acceptedRevision, 4);
++        QCOMPARE(cursor.lastSentRid, 2);
++        QCOMPARE(cursor.lastSentRevision, 9);
++    }
++
++    void staleAcceptedRevisionFallsBackToFullUpdate() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++
++        QVERIFY(WebUISync::planMaindataSync(cursor, 0, 3, 1).fullUpdate);
++        QVERIFY(!WebUISync::planMaindataSync(cursor, 1, 5, 1).fullUpdate);
++
++        const WebUISync::MaindataSyncPlan stalePlan = WebUISync::planMaindataSync(cursor, 1, 8, 6);
++
++        QVERIFY(stalePlan.fullUpdate);
++        QCOMPARE(stalePlan.baseRevision, 0);
++        QCOMPARE(stalePlan.targetRevision, 8);
++        QCOMPARE(stalePlan.responseRid, 3);
++        QCOMPARE(cursor.acceptedRid, 1);
++        QCOMPARE(cursor.acceptedRevision, 3);
++        QCOMPARE(cursor.lastSentRid, 3);
++        QCOMPARE(cursor.lastSentRevision, 8);
++    }
++
++    void acceptedRevisionImmediatelyBeforeRetainedWindowStaysIncremental() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++
++        QVERIFY(WebUISync::planMaindataSync(cursor, 0, 3, 1).fullUpdate);
++        QVERIFY(!WebUISync::planMaindataSync(cursor, 1, 5, 1).fullUpdate);
++
++        const WebUISync::MaindataSyncPlan boundaryPlan = WebUISync::planMaindataSync(cursor, 2, 7, 6);
++
++        QVERIFY(!boundaryPlan.fullUpdate);
++        QCOMPARE(boundaryPlan.baseRevision, 5);
++        QCOMPARE(boundaryPlan.targetRevision, 7);
++        QCOMPARE(boundaryPlan.responseRid, 3);
++        QCOMPARE(cursor.acceptedRid, 2);
++        QCOMPARE(cursor.acceptedRevision, 5);
++        QCOMPARE(cursor.lastSentRid, 3);
++        QCOMPARE(cursor.lastSentRevision, 7);
++    }
++
++    void unexpectedRidFallsBackToFullUpdate() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++
++        QVERIFY(WebUISync::planMaindataSync(cursor, 0, 3, 1).fullUpdate);
++        QVERIFY(!WebUISync::planMaindataSync(cursor, 1, 5, 1).fullUpdate);
++
++        const WebUISync::MaindataSyncPlan mismatchPlan = WebUISync::planMaindataSync(cursor, 77, 6, 1);
++
++        QVERIFY(mismatchPlan.fullUpdate);
++        QCOMPARE(mismatchPlan.baseRevision, 0);
++        QCOMPARE(mismatchPlan.targetRevision, 6);
++        QCOMPARE(mismatchPlan.responseRid, 3);
++    }
++
++    void responseRidWrapsBackToOneAfterOneMillion() const
++    {
++        WebUISync::MaindataSessionCursor cursor;
++        cursor.lastSentRid = 1000000;
++        cursor.lastSentRevision = 9;
++        cursor.acceptedRid = 1000000;
++        cursor.acceptedRevision = 9;
++
++        const WebUISync::MaindataSyncPlan plan = WebUISync::planMaindataSync(cursor, 1000000, 10, 1);
++
++        QVERIFY(!plan.fullUpdate);
++        QCOMPARE(plan.responseRid, 1);
++        QCOMPARE(cursor.lastSentRid, 1);
++        QCOMPARE(cursor.acceptedRid, 1000000);
++        QCOMPARE(cursor.acceptedRevision, 9);
++        QCOMPARE(cursor.lastSentRevision, 10);
++    }
++
++    void revisionStoreReplaysRetainedIncrementalChanges() const
++    {
++        WebUISync::MaindataRevisionStore store;
++        store.initialize(makeBaseMaindata());
++
++        WebUISync::MaindataSessionCursor cursor;
++        const QJsonObject firstResponse = store.buildResponse(cursor, 0);
++        QVERIFY(firstResponse.value(u"full_update"_s).toBool());
++        QCOMPARE(firstResponse.value(u"rid"_s).toInt(), 1);
++
++        store.storeRevision(makeRevisionTwoDelta());
++        QCOMPARE(store.currentRevision(), 2);
++        QCOMPARE(store.earliestRetainedRevision(), 2);
++
++        const QJsonObject incrementalResponse = store.buildResponse(cursor, 1);
++
++        QVERIFY(!incrementalResponse.value(u"full_update"_s).toBool());
++        QCOMPARE(incrementalResponse.value(u"rid"_s).toInt(), 2);
++
++        const QJsonObject categories = incrementalResponse.value(u"categories"_s).toObject();
++        QVERIFY(categories.contains(u"beta"_s));
++        QCOMPARE(categories.value(u"beta"_s).toObject().value(u"savePath"_s).toString(), u"/beta"_s);
++        QCOMPARE(incrementalResponse.value(u"categories_removed"_s).toArray().at(0).toString(), u"alpha"_s);
++
++        QCOMPARE(incrementalResponse.value(u"tags"_s).toArray().at(0).toString(), u"tag2"_s);
++        QCOMPARE(incrementalResponse.value(u"tags_removed"_s).toArray().at(0).toString(), u"tag1"_s);
++
++        const QJsonObject torrents = incrementalResponse.value(u"torrents"_s).toObject();
++        QCOMPARE(torrents.value(u"hash1"_s).toObject().value(u"progress"_s).toInt(), 75);
++        QVERIFY(!torrents.value(u"hash1"_s).toObject().contains(u"name"_s));
++
++        const QJsonObject trackers = incrementalResponse.value(u"trackers"_s).toObject();
++        QCOMPARE(trackers.value(u"udp://tracker-b"_s).toArray().at(0).toString(), u"hash1"_s);
++        QCOMPARE(incrementalResponse.value(u"trackers_removed"_s).toArray().at(0).toString(), u"udp://tracker-a"_s);
++
++        QCOMPARE(incrementalResponse.value(u"server_state"_s).toObject().value(u"queueing"_s).toBool(), true);
++    }
++
++    void revisionStoreFallsBackToFullUpdateAfterRetentionEviction() const
++    {
++        WebUISync::MaindataRevisionStore store(1, 1024 * 1024);
++        store.initialize(makeBaseMaindata());
++
++        WebUISync::MaindataSessionCursor cursor;
++        const QJsonObject firstResponse = store.buildResponse(cursor, 0);
++        QCOMPARE(firstResponse.value(u"rid"_s).toInt(), 1);
++
++        store.storeRevision(makeRevisionTwoDelta());
++
++        WebUISync::MaindataSyncData revisionThreeDelta;
++        revisionThreeDelta.serverState = {{u"refresh_interval"_s, 2000}};
++        store.storeRevision(revisionThreeDelta);
++
++        QCOMPARE(store.currentRevision(), 3);
++        QCOMPARE(store.earliestRetainedRevision(), 3);
++
++        const QJsonObject fullResponse = store.buildResponse(cursor, 1);
++
++        QVERIFY(fullResponse.value(u"full_update"_s).toBool());
++        QCOMPARE(fullResponse.value(u"rid"_s).toInt(), 2);
++        QCOMPARE(fullResponse.value(u"server_state"_s).toObject().value(u"refresh_interval"_s).toInt(), 2000);
++        QCOMPARE(fullResponse.value(u"server_state"_s).toObject().value(u"queueing"_s).toBool(), true);
++    }
++
++    void revisionStoreBuildsSerializedInitialFullUpdateForFreshSession() const
++    {
++        WebUISync::MaindataRevisionStore store;
++        store.initialize(makeBaseMaindata());
++
++        WebUISync::MaindataSessionCursor firstCursor;
++        const QByteArray firstResponse = store.buildInitialFullUpdateResponse(firstCursor, 0);
++        QVERIFY(!firstResponse.isEmpty());
++        QVERIFY(firstResponse.contains("\"full_update\":true"));
++        QVERIFY(firstResponse.contains("\"rid\":1"));
++        QVERIFY(firstResponse.contains("\"hash1\""));
++        QCOMPARE(firstCursor.lastSentRid, 1);
++        QCOMPARE(firstCursor.lastSentRevision, store.currentRevision());
++
++        WebUISync::MaindataSessionCursor secondCursor;
++        const QByteArray secondResponse = store.buildInitialFullUpdateResponse(secondCursor, 0);
++        QCOMPARE(secondResponse, firstResponse);
++
++        QVERIFY(store.buildInitialFullUpdateResponse(secondCursor, 1).isEmpty());
++    }
++};
++
++QTEST_APPLESS_MAIN(TestWebUIMaindataSync)
++#include "testwebuimaindatasync.moc"
+diff --git a/test/webui/dynamictable-browser-smoke.test.mjs b/test/webui/dynamictable-browser-smoke.test.mjs
+new file mode 100644
+index 0000000..af7b868
+--- /dev/null
++++ b/test/webui/dynamictable-browser-smoke.test.mjs
+@@ -0,0 +1,161 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import http from "node:http";
++import path from "node:path";
++import test from "node:test";
++import {createRequire} from "node:module";
++import {fileURLToPath} from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, "../..");
++const fixturePath = path.join(repoRoot, "test/webui/fixtures/virtualized-torrent-list-browser.html");
++const fixtureUrlPath = "/test/webui/fixtures/virtualized-torrent-list-browser.html";
++
++const requireFromSmokeWorkspace = createRequire("/tmp/qbt-webui-browser-smoke/package.json");
++const {chromium} = requireFromSmokeWorkspace("playwright-chromium");
++
++let server;
++let browser;
++let baseUrl;
++
++const sendNotFound = (response) => {
++    response.writeHead(404, {"Content-Type": "text/plain; charset=utf-8"});
++    response.end("Not found");
++};
++
++const contentTypeFor = (filePath) => {
++    if (filePath.endsWith(".html"))
++        return "text/html; charset=utf-8";
++    if (filePath.endsWith(".js"))
++        return "text/javascript; charset=utf-8";
++    if (filePath.endsWith(".css"))
++        return "text/css; charset=utf-8";
++    if (filePath.endsWith(".svg"))
++        return "image/svg+xml";
++    return "application/octet-stream";
++};
++
++test.before(async () => {
++    server = http.createServer((request, response) => {
++        const requestUrl = new URL(request.url, "http://127.0.0.1");
++        const decodedPath = decodeURIComponent(requestUrl.pathname);
++        const filePath = path.join(repoRoot, decodedPath);
++
++        if (!filePath.startsWith(repoRoot))
++            return sendNotFound(response);
++
++        fs.readFile(filePath, (error, contents) => {
++            if (error)
++                return sendNotFound(response);
++
++            response.writeHead(200, {"Content-Type": contentTypeFor(filePath)});
++            response.end(contents);
++        });
++    });
++
++    await new Promise((resolve) => {
++        server.listen(0, "127.0.0.1", resolve);
++    });
++
++    const address = server.address();
++    baseUrl = `http://127.0.0.1:${address.port}`;
++    browser = await chromium.launch({headless: true});
++});
++
++test.after(async () => {
++    await browser?.close();
++    await new Promise((resolve, reject) => {
++        server?.close((error) => {
++            if (error)
++                reject(error);
++            else
++                resolve();
++        });
++    });
++});
++
++async function openSmokePage() {
++    const page = await browser.newPage();
++    await page.goto(baseUrl + fixtureUrlPath);
++    await page.waitForFunction(() => (typeof window.browserSmokeApi === "object"));
++    return page;
++}
++
++test("browser smoke keeps torrent row DOM bounded and preserves selection interactions", async () => {
++    const page = await openSmokePage();
++
++    await page.evaluate(() => window.browserSmokeApi.loadTorrents(50000));
++
++    await page.waitForFunction(() => (window.browserSmokeApi.getMountedRowCount() > 0));
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.getMountedRowCount()), 5);
++
++    await page.locator('[data-row-id="torrent-0"]').click();
++    await page.locator('[data-row-id="torrent-1"]').click({modifiers: ["Control"]});
++    assert.deepEqual(await page.evaluate(() => window.browserSmokeApi.getSelectedRowIds()), ["torrent-0", "torrent-1"]);
++
++    await page.locator('[data-row-id="torrent-1"]').click();
++    await page.locator('[data-row-id="torrent-4"]').click({modifiers: ["Shift"]});
++    assert.deepEqual(await page.evaluate(() => window.browserSmokeApi.getSelectedRowIds()), ["torrent-1", "torrent-2", "torrent-3", "torrent-4"]);
++
++    await page.evaluate(() => window.browserSmokeApi.scrollToIndex(50));
++    await page.waitForFunction(() => document.querySelector('[data-row-id="torrent-50"]') !== null);
++    await page.locator('[data-row-id="torrent-50"]').click({button: "right"});
++    assert.deepEqual(await page.evaluate(() => window.browserSmokeApi.getSelectedRowIds()), ["torrent-50"]);
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.getMountedRowCount()), 7);
++
++    await page.close();
++});
++
++test("browser smoke preserves double-click actions and tbody rebuilds", async () => {
++    const page = await openSmokePage();
++
++    await page.evaluate(() => window.browserSmokeApi.loadTorrents(2, {
++        activeIndexes: [1]
++    }));
++
++    await page.locator('[data-row-id="torrent-0"]').dblclick();
++    let counters = await page.evaluate(() => window.browserSmokeApi.getActionCounters());
++    assert.equal(counters.startCalls, 1);
++    assert.equal(counters.pauseCalls, 0);
++    assert.ok(counters.propertiesUpdates >= 1);
++    assert.deepEqual(await page.evaluate(() => window.browserSmokeApi.getSelectedRowIds()), ["torrent-0"]);
++    const firstPropertiesUpdates = counters.propertiesUpdates;
++
++    await page.locator('[data-row-id="torrent-1"]').dblclick();
++    counters = await page.evaluate(() => window.browserSmokeApi.getActionCounters());
++    assert.equal(counters.startCalls, 1);
++    assert.equal(counters.pauseCalls, 1);
++    assert.ok(counters.propertiesUpdates > firstPropertiesUpdates);
++    assert.deepEqual(await page.evaluate(() => window.browserSmokeApi.getSelectedRowIds()), ["torrent-1"]);
++
++    await page.evaluate(() => {
++        window.browserSmokeApi.clearTbodyAndRefresh();
++    });
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.getMountedRowCount()), 2);
++
++    await page.close();
++});
++
++test("browser smoke preserves sorting and column visibility with virtual rows", async () => {
++    const page = await openSmokePage();
++
++    await page.evaluate(async () => {
++        await window.browserSmokeApi.loadTorrents(100);
++        window.browserSmokeApi.reverseNameSort();
++    });
++
++    await page.waitForFunction(() => document.querySelector('[data-row-id="torrent-99"]') !== null);
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.getFirstMountedRowId()), "torrent-99");
++
++    await page.evaluate(() => {
++        window.browserSmokeApi.toggleNameColumn(false);
++    });
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.areMountedNameCellsHidden()), true);
++
++    await page.evaluate(() => {
++        window.browserSmokeApi.toggleNameColumn(true);
++    });
++    assert.equal(await page.evaluate(() => window.browserSmokeApi.areMountedNameCellsHidden()), false);
++
++    await page.close();
++});
+diff --git a/test/webui/dynamictable-logical-order.test.mjs b/test/webui/dynamictable-logical-order.test.mjs
+new file mode 100644
+index 0000000..3cc8e24
+--- /dev/null
++++ b/test/webui/dynamictable-logical-order.test.mjs
+@@ -0,0 +1,157 @@
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import {fileURLToPath, pathToFileURL} from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const helperModulePath = path.resolve(__dirname, "../../src/webui/www/private/scripts/torrent-list-state.js");
++const dynamicTableModulePath = path.resolve(__dirname, "../../src/webui/www/private/scripts/dynamicTable.js");
++
++const helperModule = await import(pathToFileURL(helperModulePath).href);
++const TorrentListState = helperModule.default ?? helperModule;
++
++globalThis.window = {
++    qBittorrent: {
++        TorrentListState,
++        FileTree: {
++            FileTree: function() {}
++        }
++    }
++};
++
++globalThis.Class = function(definition) {
++    const Parent = definition.Extends ?? null;
++
++    function Klass() {
++        if (typeof this.initialize === "function")
++            this.initialize.apply(this, arguments);
++    }
++
++    if (Parent) {
++        Klass.prototype = Object.create(Parent.prototype);
++        Klass.prototype.constructor = Klass;
++    }
++
++    for (const [key, value] of Object.entries(definition)) {
++        if (key !== "Extends")
++            Klass.prototype[key] = value;
++    }
++
++    return Klass;
++};
++
++globalThis.$ = function() {
++    throw new Error("DOM access is not expected when logical row order is enabled");
++};
++
++await import(pathToFileURL(dynamicTableModulePath).href);
++
++const {TorrentsTable} = globalThis.window.qBittorrent.DynamicTable;
++
++const createLogicalTable = ({selectedRows = [], stubEnsureRowIsVisible = true} = {}) => {
++    const table = new TorrentsTable();
++    const calls = [];
++    const logicalRows = [
++        {rowId: "torrent-a"},
++        {rowId: "torrent-b"},
++        {rowId: "torrent-c"}
++    ];
++
++    table.logicalRowOrderEnabled = true;
++    table.logicalRows = logicalRows;
++    table.rowOrderState = TorrentListState.buildRowOrderState(logicalRows);
++    table.selectedRows = selectedRows.slice();
++    table.deselectAll = function() {
++        calls.push(["deselectAll"]);
++        this.selectedRows = [];
++    };
++    table.selectRow = function(rowId) {
++        calls.push(["selectRow", rowId]);
++        this.selectedRows.push(rowId);
++    };
++    if (stubEnsureRowIsVisible) {
++        table.ensureRowIsVisible = function(rowId) {
++            calls.push(["ensureRowIsVisible", rowId]);
++        };
++    }
++
++    return {table, calls};
++};
++
++test("selectNextRow uses logical row order and requests visibility without DOM traversal", () => {
++    const {table, calls} = createLogicalTable({selectedRows: ["torrent-b"]});
++
++    table.selectNextRow();
++
++    assert.deepEqual(calls, [
++        ["deselectAll"],
++        ["selectRow", "torrent-c"],
++        ["ensureRowIsVisible", "torrent-c"]
++    ]);
++    assert.deepEqual(table.selectedRows, ["torrent-c"]);
++});
++
++test("selectPreviousRow uses logical row order and can move from no selection without DOM traversal", () => {
++    const {table, calls} = createLogicalTable();
++
++    table.selectPreviousRow();
++
++    assert.deepEqual(calls, []);
++    assert.deepEqual(table.selectedRows, []);
++});
++
++test("selectNextRow focuses the newly selected logical row after visibility is ensured", () => {
++    const {table, calls} = createLogicalTable({selectedRows: ["torrent-b"]});
++
++    table.getTrByRowId = (rowId) => {
++        if (rowId !== "torrent-c")
++            return null;
++
++        return {
++            focus: () => {
++                calls.push(["focus", rowId]);
++            }
++        };
++    };
++
++    table.selectNextRow();
++
++    assert.deepEqual(calls, [
++        ["deselectAll"],
++        ["selectRow", "torrent-c"],
++        ["ensureRowIsVisible", "torrent-c"],
++        ["focus", "torrent-c"]
++    ]);
++});
++
++test("ensureRowIsVisible scrolls the virtual viewport for logically selected rows outside the mounted window", () => {
++    const {table, calls} = createLogicalTable({stubEnsureRowIsVisible: false});
++    const scrollHost = {
++        scrollTop: 0,
++        clientHeight: 40
++    };
++    const originalDollar = globalThis.$;
++
++    table.virtualTableRenderingEnabled = true;
++    table.virtualRowHeight = 20;
++    table.dynamicTableDivId = "torrentsTableDiv";
++    table.getTrByRowId = () => null;
++    table.refreshVirtualTableWindow = function() {
++        calls.push(["refreshVirtualTableWindow"]);
++    };
++
++    globalThis.$ = function(id) {
++        assert.equal(id, "torrentsTableDiv");
++        return scrollHost;
++    };
++
++    try {
++        table.ensureRowIsVisible("torrent-c");
++    }
++    finally {
++        globalThis.$ = originalDollar;
++    }
++
++    assert.equal(scrollHost.scrollTop, 20);
++    assert.deepEqual(calls, [["refreshVirtualTableWindow"]]);
++});
+diff --git a/test/webui/dynamictable-virtualization.test.mjs b/test/webui/dynamictable-virtualization.test.mjs
+new file mode 100644
+index 0000000..043cc2f
+--- /dev/null
++++ b/test/webui/dynamictable-virtualization.test.mjs
+@@ -0,0 +1,713 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import path from "node:path";
++import test from "node:test";
++import vm from "node:vm";
++import {fileURLToPath, pathToFileURL} from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const helperModulePath = path.resolve(__dirname, "../../src/webui/www/private/scripts/torrent-list-state.js");
++const dynamicTableSourcePath = path.resolve(__dirname, "../../src/webui/www/private/scripts/dynamicTable.js");
++
++const helperModule = await import(pathToFileURL(helperModulePath).href);
++const TorrentListState = helperModule.default ?? helperModule;
++const dynamicTableSource = fs.readFileSync(dynamicTableSourcePath, "utf8");
++
++if (!Array.prototype.each) {
++    Array.prototype.each = function(callback, context) {
++        this.forEach(function(value, index) {
++            callback.call(context, value, index, this);
++        }, this);
++        return this;
++    };
++}
++
++if (!Array.prototype.contains) {
++    Array.prototype.contains = function(value) {
++        return this.indexOf(value) !== -1;
++    };
++}
++
++if (!Array.prototype.erase) {
++    Array.prototype.erase = function(value) {
++        let index = this.indexOf(value);
++        while (index !== -1) {
++            this.splice(index, 1);
++            index = this.indexOf(value);
++        }
++        return this;
++    };
++}
++
++if (!Array.prototype.empty) {
++    Array.prototype.empty = function() {
++        this.length = 0;
++        return this;
++    };
++}
++
++class FakeElement {
++    constructor(tag) {
++        this.tag = tag;
++        this.children = [];
++        this.parent = null;
++        this.properties = Object.create(null);
++        this.styles = Object.create(null);
++        this.events = Object.create(null);
++        this.classes = new Set();
++        this.text = "";
++        this.html = "";
++        this.offsetHeight = (tag === "tr") ? 20 : 0;
++        this.clientHeight = 0;
++        this.offsetHeight = (tag === "tbody") ? 0 : this.offsetHeight;
++    }
++
++    get firstChild() {
++        return this.children[0] ?? null;
++    }
++
++    setProperty(name, value) {
++        this.properties[name] = value;
++        return this;
++    }
++
++    setAttribute(name, value) {
++        return this.setProperty(name, value);
++    }
++
++    getProperty(name) {
++        return this.properties[name];
++    }
++
++    setStyle(name, value) {
++        this.styles[name] = value;
++        return this;
++    }
++
++    getStyle(name) {
++        return this.styles[name] ?? "";
++    }
++
++    setStyles(styles) {
++        Object.assign(this.styles, styles);
++        return this;
++    }
++
++    set(name, value) {
++        if (name === "text")
++            this.text = value;
++        else if (name === "html")
++            this.html = value;
++        else
++            this.properties[name] = value;
++        return this;
++    }
++
++    addClass(className) {
++        this.classes.add(className);
++        return this;
++    }
++
++    removeClass(className) {
++        this.classes.delete(className);
++        return this;
++    }
++
++    hasClass(className) {
++        return this.classes.has(className);
++    }
++
++    addEvent(name, handler) {
++        this.events[name] = handler;
++        return this;
++    }
++
++    fireEvent(name, payload) {
++        return this.events[name]?.call(this, payload);
++    }
++
++    adopt(...children) {
++        for (const child of children.flat()) {
++            if (child.parent)
++                child.dispose();
++            child.parent = this;
++            this.children.push(child);
++        }
++        return this;
++    }
++
++    appendChild(child) {
++        return this.adopt(child);
++    }
++
++    inject(target, where) {
++        if (where === "before") {
++            const parent = target.parent;
++            const index = parent.children.indexOf(target);
++            if (this.parent)
++                this.dispose();
++            this.parent = parent;
++            parent.children.splice(index, 0, this);
++            return this;
++        }
++
++        return target.adopt(this);
++    }
++
++    injectInside(target) {
++        return target.adopt(this);
++    }
++
++    dispose() {
++        if (!this.parent)
++            return this;
++
++        const index = this.parent.children.indexOf(this);
++        if (index >= 0)
++            this.parent.children.splice(index, 1);
++        this.parent = null;
++        return this;
++    }
++
++    destroy() {
++        this.dispose();
++        this.destroyed = true;
++        return this;
++    }
++
++    removeChild(child) {
++        child.dispose();
++        return child;
++    }
++
++    getChildren(tag) {
++        if (!tag)
++            return this.children.slice();
++        return this.children.filter(child => child.tag === tag);
++    }
++
++    getElements(tag) {
++        return this.getChildren(tag);
++    }
++
++    getSize() {
++        return {y: this.offsetHeight};
++    }
++
++    focus() {
++        this.focused = true;
++        return this;
++    }
++
++    scrollIntoView() {
++        this.scrolledIntoView = true;
++    }
++}
++
++function createHash(initialRows = []) {
++    const map = new Map(initialRows.map(row => [row.rowId, row]));
++
++    return {
++        has: key => map.has(key),
++        get: key => map.get(key),
++        set: (key, value) => {
++            map.set(key, value);
++        },
++        erase: key => {
++            map.delete(key);
++        },
++        empty: () => {
++            map.clear();
++        },
++        getValues: () => Array.from(map.values()),
++        getKeys: () => Array.from(map.keys())
++    };
++}
++
++function createLogicalRows(count, state = "pausedDL") {
++    const rows = [];
++
++    for (let index = 0; index < count; ++index) {
++        const rowId = `torrent-${index}`;
++        const row = {
++            rowId,
++            full_data: {
++                name: `Torrent ${index}`,
++                state
++            },
++            data: {
++                name: `Torrent ${index}`,
++                state
++            }
++        };
++
++        rows.push(row);
++        rows[rowId] = row;
++    }
++
++    return rows;
++}
++
++function createSandbox() {
++    const scrollHost = {
++        scrollTop: 0,
++        clientHeight: 60,
++        offsetHeight: 60
++    };
++    const sandbox = {
++        console,
++        window: {
++            qBittorrent: {
++                TorrentListState,
++                FileTree: {
++                    FileTree: function() {}
++                }
++            },
++            requestAnimationFrame: callback => {
++                callback();
++                return 1;
++            }
++        },
++        document: {},
++        Element: FakeElement,
++        Class: function(definition) {
++            const Parent = definition.Extends ?? null;
++
++            function Klass() {
++                if (typeof this.initialize === "function")
++                    this.initialize.apply(this, arguments);
++            }
++
++            if (Parent) {
++                Klass.prototype = Object.create(Parent.prototype);
++                Klass.prototype.constructor = Klass;
++            }
++
++            for (const [key, value] of Object.entries(definition)) {
++                if (key !== "Extends")
++                    Klass.prototype[key] = value;
++            }
++
++            return Klass;
++        },
++        LocalPreferences: {
++            get: (key, fallback = null) => fallback,
++            set: () => {}
++        },
++        MUI: {
++            ieLegacySupport: false
++        },
++        setTimeout,
++        clearTimeout,
++        setInterval,
++        clearInterval,
++        startFNCalls: 0,
++        pauseFNCalls: 0,
++        updatePropertiesPanelCalls: 0
++    };
++
++    sandbox.startFN = () => {
++        sandbox.startFNCalls += 1;
++    };
++    sandbox.pauseFN = () => {
++        sandbox.pauseFNCalls += 1;
++    };
++    sandbox.updatePropertiesPanel = () => {
++        sandbox.updatePropertiesPanelCalls += 1;
++    };
++    sandbox.$ = id => {
++        assert.equal(id, "torrentsTableDiv");
++        return scrollHost;
++    };
++    sandbox.$$ = () => [];
++
++    vm.createContext(sandbox);
++    vm.runInContext(`
++        Array.prototype.each = function(callback, context) {
++            this.forEach(function(value, index) {
++                callback.call(context, value, index, this);
++            }, this);
++            return this;
++        };
++        Array.prototype.contains = function(value) {
++            return this.indexOf(value) !== -1;
++        };
++        Array.prototype.erase = function(value) {
++            let index = this.indexOf(value);
++            while (index !== -1) {
++                this.splice(index, 1);
++                index = this.indexOf(value);
++            }
++            return this;
++        };
++        Array.prototype.empty = function() {
++            this.length = 0;
++            return this;
++        };
++    `, sandbox);
++    vm.runInContext(dynamicTableSource, sandbox, {filename: dynamicTableSourcePath});
++
++    return {sandbox, scrollHost};
++}
++
++function createVirtualizedTorrentTable({rowCount = 100, scrollTop = 0, overscan = 2, state = "pausedDL"} = {}) {
++    const {sandbox, scrollHost} = createSandbox();
++    const TorrentsTable = sandbox.window.qBittorrent.DynamicTable.TorrentsTable;
++    const table = new TorrentsTable();
++    const logicalRows = createLogicalRows(rowCount, state);
++
++    scrollHost.scrollTop = scrollTop;
++    table.dynamicTableDivId = "torrentsTableDiv";
++    table.tableBody = new FakeElement("tbody");
++    table.columns = [{
++        visible: "1",
++        force_hide: false,
++        dataProperties: ["name"],
++        updateTd: (td, row) => {
++            td.set("text", row.full_data.name);
++            td.set("title", row.full_data.name);
++        }
++    }];
++    table.contextMenu = {
++        targets: [],
++        addTarget(target) {
++            this.targets.push(target);
++        }
++    };
++    table.rows = createHash(logicalRows);
++    table.selectedRows = [];
++    table.logicalRowOrderEnabled = true;
++    table.virtualTableRenderingEnabled = true;
++    table.virtualRowHeight = 20;
++    table.virtualOverscan = overscan;
++    table.virtualReusableRows = [];
++    table.virtualTopSpacerRow = null;
++    table.virtualBottomSpacerRow = null;
++    table.rowOrderState = null;
++    table.logicalRows = [];
++    table.getFilteredAndSortedRows = () => logicalRows;
++
++    return {sandbox, scrollHost, table, logicalRows};
++}
++
++function createFullTorrentTableForColumnTests({scrollTop = 0} = {}) {
++    const {sandbox, scrollHost} = createSandbox();
++    const TorrentsTable = sandbox.window.qBittorrent.DynamicTable.TorrentsTable;
++    const table = new TorrentsTable();
++    const logicalRows = createLogicalRows(20, "pausedDL");
++
++    sandbox.window.qBittorrent.Misc = {
++        friendlyUnit: value => String(value),
++        naturalSortCollator: {
++            compare: (left, right) => String(left).localeCompare(String(right))
++        }
++    };
++    sandbox.window.qBittorrent.ProgressBar = {
++        ProgressBar: function(value, options) {
++            this.value = value;
++            this.options = options;
++            this.setValue = nextValue => {
++                this.value = nextValue;
++            };
++            this.getValue = () => this.value;
++            this.setWidth = width => {
++                this.width = width;
++            };
++        }
++    };
++    vm.runInContext(`
++        Number.prototype.round = function(precision) {
++            const factor = Math.pow(10, precision || 0);
++            return Math.round(this * factor) / factor;
++        };
++        Number.prototype.toFloat = function() {
++            return Number(this);
++        };
++    `, sandbox);
++
++    scrollHost.scrollTop = scrollTop;
++    table.dynamicTableDivId = "torrentsTableDiv";
++    table.dynamicTableFixedHeaderDivId = "torrentsTableFixedHeaderDiv";
++    table.tableBody = new FakeElement("tbody");
++    table.hiddenTableHeader = new FakeElement("tr");
++    table.fixedTableHeader = new FakeElement("tr");
++    table.columns = [];
++    table.contextMenu = {
++        targets: [],
++        addTarget(target) {
++            this.targets.push(target);
++        }
++    };
++    table.initColumns();
++    table.rows = createHash(logicalRows.map((row, index) => ({
++        ...row,
++        full_data: {
++            ...row.full_data,
++            progress: index / 20,
++            state: "pausedDL",
++            name: `Torrent ${index}`
++        },
++        data: {
++            progress: index / 20,
++            state: "pausedDL",
++            name: `Torrent ${index}`
++        }
++    })));
++    table.selectedRows = [];
++    table.logicalRowOrderEnabled = true;
++    table.virtualTableRenderingEnabled = true;
++    table.virtualRowHeight = 20;
++    table.virtualOverscan = 2;
++    table.virtualReusableRows = [];
++    table.virtualTopSpacerRow = null;
++    table.virtualBottomSpacerRow = null;
++    table.rowOrderState = null;
++    table.logicalRows = [];
++
++    const rows = table.rows.getValues();
++    rows.forEach(row => {
++        rows[row.rowId] = row;
++    });
++    table.getFilteredAndSortedRows = () => rows;
++
++    return {sandbox, scrollHost, table, logicalRows: rows};
++}
++
++test("virtual updateTable keeps mounted torrent rows bounded to the viewport window", () => {
++    const {table, logicalRows} = createVirtualizedTorrentTable({scrollTop: 200});
++
++    table.updateTable(false);
++
++    const mountedRowIds = table.getDataRows().map(row => row.rowId);
++
++    assert.deepEqual(mountedRowIds, logicalRows.slice(8, 15).map(row => row.rowId));
++    assert.equal(table.getDataRows().length, 7);
++    assert.equal(table.contextMenu.targets.length, 7);
++    assert.equal(table.virtualTopSpacerRow._virtualSpacerContent.styles.height, "160px");
++    assert.equal(table.virtualBottomSpacerRow._virtualSpacerContent.styles.height, "1700px");
++});
++
++test("virtual scrolling reuses detached torrent row elements instead of creating an unbounded target set", () => {
++    const {scrollHost, table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(false);
++    const firstWindowRows = table.getDataRows().slice();
++
++    scrollHost.scrollTop = 200;
++    table.refreshVirtualTableWindow(false);
++
++    const secondWindowRows = table.getDataRows();
++    const reusedRowCount = secondWindowRows.filter(row => firstWindowRows.includes(row)).length;
++
++    assert.equal(firstWindowRows.length, 5);
++    assert.equal(secondWindowRows.length, 7);
++    assert.equal(reusedRowCount, 5);
++    assert.equal(table.contextMenu.targets.length, 7);
++});
++
++test("selected torrent rows regain the selected class when they scroll back into the mounted window", () => {
++    const {scrollHost, table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.selectedRows = ["torrent-50"];
++    table.updateTable(false);
++
++    scrollHost.scrollTop = 1000;
++    table.refreshVirtualTableWindow(false);
++
++    const selectedRow = table.getTrByRowId("torrent-50");
++
++    assert.ok(selectedRow);
++    assert.equal(selectedRow.hasClass("selected"), true);
++});
++
++test("logical selection state remains readable even when the selected torrent is outside the mounted window", () => {
++    const {table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.selectedRows = ["torrent-75"];
++    table.updateTable(false);
++
++    const selectedRows = table.selectedRowsIds();
++
++    assert.deepEqual(selectedRows, ["torrent-75"]);
++    assert.equal(table.getCurrentTorrentID(), "torrent-75");
++
++    selectedRows.push("mutated");
++    assert.deepEqual(table.selectedRowsIds(), ["torrent-75"]);
++});
++
++test("torrent rows keep double-click start/pause behavior and properties-panel selection updates", () => {
++    const {sandbox, table} = createVirtualizedTorrentTable({rowCount: 1, state: "pausedDL"});
++
++    table.updateTable(true);
++    const row = table.getTrByRowId("torrent-0");
++
++    assert.ok(row);
++    assert.equal(row.hasClass("torrentsTableContextMenuTarget"), true);
++
++    row.fireEvent("dblclick", {
++        stop() {}
++    });
++
++    assert.deepEqual(table.selectedRows, ["torrent-0"]);
++    assert.equal(sandbox.startFNCalls, 1);
++    assert.equal(sandbox.pauseFNCalls, 0);
++    assert.equal(sandbox.updatePropertiesPanelCalls, 1);
++});
++
++test("torrent rows still pause on double-click when the torrent is active", () => {
++    const {sandbox, table} = createVirtualizedTorrentTable({rowCount: 1, state: "uploading"});
++
++    table.updateTable(true);
++    const row = table.getTrByRowId("torrent-0");
++
++    row.fireEvent("dblclick", {
++        stop() {}
++    });
++
++    assert.equal(sandbox.startFNCalls, 0);
++    assert.equal(sandbox.pauseFNCalls, 1);
++});
++
++test("virtual table can rebuild after column-reorder style tbody clearing", () => {
++    const {table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(true);
++
++    while (table.tableBody.firstChild)
++        table.tableBody.removeChild(table.tableBody.firstChild);
++
++    table.updateTable(true);
++
++    assert.equal(table.getDataRows().length, 5);
++});
++
++test("virtualized torrent rows follow the latest logical sort order", () => {
++    const {table, logicalRows} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(true);
++
++    const reversedRows = logicalRows.slice().reverse();
++    reversedRows.forEach(row => {
++        reversedRows[row.rowId] = row;
++    });
++    table.getFilteredAndSortedRows = () => reversedRows;
++
++    table.updateTable(false);
++
++    assert.deepEqual(
++        table.getDataRows().map(row => row.rowId),
++        reversedRows.slice(0, 5).map(row => row.rowId)
++    );
++});
++
++test("progress column resize logic only touches mounted torrent rows when spacer rows exist", () => {
++    const {table} = createFullTorrentTableForColumnTests({scrollTop: 0});
++
++    table.updateTable(true);
++
++    const progressColumn = table.columns["progress"];
++    const originalUpdateTd = progressColumn.updateTd;
++    let updateCount = 0;
++
++    progressColumn.updateTd = function(td, row) {
++        updateCount += 1;
++        return originalUpdateTd.call(this, td, row);
++    };
++    progressColumn.width = 120;
++    progressColumn.onResize("progress");
++
++    const dataRows = table.getDataRows();
++
++    assert.equal(dataRows.length, 5);
++    assert.equal(updateCount, dataRows.length);
++});
++
++test("column visibility toggles still update mounted torrent cells with virtual spacer rows present", () => {
++    const {table} = createFullTorrentTableForColumnTests({scrollTop: 0});
++
++    table.updateTable(true);
++
++    const nameColumnPos = table.getColumnPos("name");
++
++    table.columns["name"].visible = "0";
++    table.updateColumn("name");
++    assert.ok(table.getDataRows().every(row => row.getElements("td")[nameColumnPos].hasClass("invisible")));
++
++    table.columns["name"].visible = "1";
++    table.updateColumn("name");
++    assert.ok(table.getDataRows().every(row => !row.getElements("td")[nameColumnPos].hasClass("invisible")));
++});
++
++test("very large logical torrent sets still keep mounted DOM rows bounded to the active window", () => {
++    const {table} = createVirtualizedTorrentTable({
++        rowCount: 50000,
++        scrollTop: 100000
++    });
++
++    table.updateTable(false);
++
++    assert.equal(table.getDataRows().length, 7);
++});
++
++test("ctrl-click multi-selection still works on mounted virtual torrent rows", () => {
++    const {table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(true);
++
++    const firstRow = table.getTrByRowId("torrent-0");
++    const secondRow = table.getTrByRowId("torrent-1");
++
++    firstRow.fireEvent("click", {
++        stop() {},
++        control: false,
++        meta: false,
++        shift: false
++    });
++    secondRow.fireEvent("click", {
++        stop() {},
++        control: true,
++        meta: false,
++        shift: false
++    });
++
++    assert.deepEqual(table.selectedRowsIds(), ["torrent-0", "torrent-1"]);
++});
++
++test("shift-click selection still expands across the logical torrent order", () => {
++    const {table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(true);
++
++    table.getTrByRowId("torrent-1").fireEvent("click", {
++        stop() {},
++        control: false,
++        meta: false,
++        shift: false
++    });
++    table.getTrByRowId("torrent-4").fireEvent("click", {
++        stop() {},
++        control: false,
++        meta: false,
++        shift: true
++    });
++
++    assert.deepEqual(table.selectedRowsIds(), [
++        "torrent-1",
++        "torrent-2",
++        "torrent-3",
++        "torrent-4"
++    ]);
++});
++
++test("context-menu selection still works after scrolling remounts a different torrent window", () => {
++    const {scrollHost, table} = createVirtualizedTorrentTable({scrollTop: 0});
++
++    table.updateTable(true);
++    scrollHost.scrollTop = 1000;
++    table.refreshVirtualTableWindow(false);
++
++    const row = table.getTrByRowId("torrent-50");
++    row.fireEvent("contextmenu", {});
++
++    assert.deepEqual(table.selectedRowsIds(), ["torrent-50"]);
++});
+diff --git a/test/webui/fixtures/virtualized-torrent-list-browser.html b/test/webui/fixtures/virtualized-torrent-list-browser.html
+new file mode 100644
+index 0000000..0909042
+--- /dev/null
++++ b/test/webui/fixtures/virtualized-torrent-list-browser.html
+@@ -0,0 +1,276 @@
++<!DOCTYPE html>
++<html lang="en">
++<head>
++    <meta charset="utf-8">
++    <title>qBittorrent Virtualized Torrent List Browser Smoke</title>
++    <style>
++        body {
++            margin: 0;
++            padding: 16px;
++            font-family: sans-serif;
++        }
++
++        #torrentsTableFixedHeaderDiv {
++            width: 900px;
++            overflow: hidden;
++        }
++
++        #torrentsTableDiv {
++            width: 900px;
++            height: 60px;
++            overflow: auto;
++            border: 1px solid #ccc;
++        }
++
++        table.dynamicTable {
++            border-collapse: collapse;
++            width: 100%;
++        }
++
++        table.dynamicTable td,
++        table.dynamicTable th {
++            box-sizing: border-box;
++            height: 20px;
++            max-height: 20px;
++            padding: 0 4px;
++            white-space: nowrap;
++        }
++
++        table.dynamicTable tbody tr.selected {
++            background: #d9ebff;
++        }
++    </style>
++</head>
++<body>
++    <input type="text" id="torrentsFilterInput" value="" />
++
++    <div id="torrentsTableFixedHeaderDiv" class="dynamicTableFixedHeaderDiv">
++        <table class="dynamicTable unselectable" style="position:relative;">
++            <thead>
++                <tr class="dynamicTableHeader"></tr>
++            </thead>
++        </table>
++    </div>
++
++    <div id="torrentsTableDiv" class="dynamicTableDiv">
++        <table class="dynamicTable unselectable">
++            <thead>
++                <tr class="dynamicTableHeader"></tr>
++            </thead>
++            <tbody></tbody>
++        </table>
++    </div>
++
++    <script>
++        var LocalPreferences = {
++            _values: Object.create(null),
++            get: function(key, fallback) {
++                return Object.prototype.hasOwnProperty.call(this._values, key) ? this._values[key] : fallback;
++            },
++            set: function(key, value) {
++                this._values[key] = value;
++            }
++        };
++        var MUI = {
++            ieLegacySupport: false
++        };
++        var startFN = function() {
++            window.browserSmokeState.startCalls += 1;
++        };
++        var pauseFN = function() {
++            window.browserSmokeState.pauseCalls += 1;
++        };
++        var updatePropertiesPanel = function() {
++            window.browserSmokeState.propertiesUpdates += 1;
++        };
++        var CATEGORIES_ALL = 1;
++        var CATEGORIES_UNCATEGORIZED = 2;
++        var TAGS_ALL = 1;
++        var TAGS_UNTAGGED = 2;
++        var TRACKERS_ALL = 1;
++        var TRACKERS_TRACKERLESS = 2;
++        var useSubcategories = true;
++        var category_list = {};
++        var trackerList = new Map();
++        var selected_filter = 'all';
++        var selected_category = CATEGORIES_ALL;
++        var selectedTag = TAGS_ALL;
++        var selectedTracker = TRACKERS_ALL;
++        var genHash = function(string) {
++            let hash = 0;
++            for (let i = 0; i < string.length; ++i)
++                hash = ((Math.imul(hash, 31) + string.charCodeAt(i)) | 0);
++            return hash;
++        };
++
++        window.qBittorrent = window.qBittorrent || {};
++        window.qBittorrent.FileTree = {
++            FileTree: function() {}
++        };
++    </script>
++    <script src="/src/webui/www/private/scripts/lib/MooTools-Core-1.6.0-compat-compressed.js"></script>
++    <script src="/src/webui/www/private/scripts/lib/MooTools-More-1.6.0-compat-compressed.js"></script>
++    <script src="/src/webui/www/private/scripts/misc.js"></script>
++    <script src="/src/webui/www/private/scripts/progressbar.js"></script>
++    <script src="/src/webui/www/private/scripts/torrent-list-state.js"></script>
++    <script src="/src/webui/www/private/scripts/dynamicTable.js"></script>
++    <script>
++        'use strict';
++
++        window.browserSmokeState = {
++            startCalls: 0,
++            pauseCalls: 0,
++            propertiesUpdates: 0
++        };
++
++        const bodyElement = document.querySelector('#torrentsTableDiv tbody');
++        const hiddenHeaderRow = document.querySelector('#torrentsTableDiv thead tr');
++        const fixedHeaderRow = document.querySelector('#torrentsTableFixedHeaderDiv thead tr');
++        let torrentsTable = null;
++
++        const createTorrentData = function(index, isActive) {
++            const state = isActive ? 'uploading' : 'pausedDL';
++            return {
++                rowId: `torrent-${index}`,
++                hash: `torrent-${index}`,
++                name: `Torrent ${index}`,
++                state: state,
++                status: state,
++                priority: index + 1,
++                size: 1024 * (index + 1),
++                total_size: 1024 * (index + 1),
++                progress: (index % 100) / 100,
++                num_seeds: index % 10,
++                num_complete: 100 + (index % 10),
++                num_leechs: index % 7,
++                num_incomplete: 50 + (index % 7),
++                dlspeed: 0,
++                upspeed: isActive ? 2048 : 0,
++                eta: 0,
++                ratio: index / 10,
++                category: '',
++                tags: '',
++                added_on: 1700000000 + index,
++                dl_limit: -1,
++                up_limit: -1,
++                trackers_count: 0
++            };
++        };
++
++        const resetActionCounters = function() {
++            window.browserSmokeState.startCalls = 0;
++            window.browserSmokeState.pauseCalls = 0;
++            window.browserSmokeState.propertiesUpdates = 0;
++        };
++
++        const createTable = function() {
++            while (bodyElement.firstChild)
++                bodyElement.removeChild(bodyElement.firstChild);
++
++            while (hiddenHeaderRow.firstChild)
++                hiddenHeaderRow.removeChild(hiddenHeaderRow.firstChild);
++
++            while (fixedHeaderRow.firstChild)
++                fixedHeaderRow.removeChild(fixedHeaderRow.firstChild);
++
++            torrentsTable = new window.qBittorrent.DynamicTable.TorrentsTable();
++            torrentsTable.dynamicTableDivId = 'torrentsTableDiv';
++            torrentsTable.dynamicTableFixedHeaderDivId = 'torrentsTableFixedHeaderDiv';
++            torrentsTable.fixedTableHeader = fixedHeaderRow;
++            torrentsTable.hiddenTableHeader = hiddenHeaderRow;
++            torrentsTable.tableBody = bodyElement;
++            torrentsTable.rows = new Hash();
++            torrentsTable.selectedRows = [];
++            torrentsTable.columns = [];
++            torrentsTable.contextMenu = {
++                targets: [],
++                addTarget: function(target) {
++                    if (!this.targets.contains(target))
++                        this.targets.push(target);
++                }
++            };
++            torrentsTable.logicalRowOrderEnabled = true;
++            torrentsTable.logicalRows = [];
++            torrentsTable.rowOrderState = null;
++            torrentsTable.virtualTableRenderingEnabled = true;
++            torrentsTable.virtualRowHeight = 20;
++            torrentsTable.virtualRowHeightFallback = 20;
++            torrentsTable.virtualOverscan = 2;
++            torrentsTable.virtualWindowRange = null;
++            torrentsTable.virtualTopSpacerRow = null;
++            torrentsTable.virtualBottomSpacerRow = null;
++            torrentsTable.virtualReusableRows = [];
++            torrentsTable.virtualRefreshFrameId = null;
++            torrentsTable.sortedColumn = 0;
++            torrentsTable.reverseSort = '0';
++            torrentsTable.initColumns();
++            torrentsTable.updateTableHeaders();
++            torrentsTable.measureVirtualRowHeight = function() {
++                return 20;
++            };
++        };
++
++        const loadTorrents = async function(count, options) {
++            options = options || {};
++            const activeIndexes = new Set(options.activeIndexes || []);
++            const tableDiv = document.getElementById('torrentsTableDiv');
++
++            resetActionCounters();
++            createTable();
++            tableDiv.scrollTop = 0;
++
++            for (let index = 0; index < count; ++index)
++                torrentsTable.updateRowData(createTorrentData(index, activeIndexes.has(index)));
++
++            torrentsTable.updateTable(true);
++            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
++        };
++
++        window.browserSmokeApi = {
++            loadTorrents: loadTorrents,
++            getMountedRowCount: function() {
++                return torrentsTable.getDataRows().length;
++            },
++            getSelectedRowIds: function() {
++                return torrentsTable.selectedRowsIds();
++            },
++            scrollToIndex: async function(index) {
++                const tableDiv = document.getElementById('torrentsTableDiv');
++                tableDiv.scrollTop = index * 20;
++                torrentsTable.refreshVirtualTableWindow(false);
++                await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
++            },
++            getActionCounters: function() {
++                return {
++                    startCalls: window.browserSmokeState.startCalls,
++                    pauseCalls: window.browserSmokeState.pauseCalls,
++                    propertiesUpdates: window.browserSmokeState.propertiesUpdates
++                };
++            },
++            clearTbodyAndRefresh: function() {
++                while (bodyElement.firstChild)
++                    bodyElement.removeChild(bodyElement.firstChild);
++                torrentsTable.updateTable(true);
++            },
++            reverseNameSort: function() {
++                torrentsTable.sortedColumn = torrentsTable.getColumnPos('name');
++                torrentsTable.reverseSort = '1';
++                torrentsTable.updateTable(false);
++            },
++            getFirstMountedRowId: function() {
++                const rows = torrentsTable.getDataRows();
++                return rows.length > 0 ? rows[0].rowId : null;
++            },
++            toggleNameColumn: function(show) {
++                torrentsTable.showColumn('name', show);
++            },
++            areMountedNameCellsHidden: function() {
++                const pos = torrentsTable.getColumnPos('name');
++                return torrentsTable.getDataRows().every(function(row) {
++                    return row.getElements('td')[pos].hasClass('invisible');
++                });
++            }
++        };
++    </script>
++</body>
++</html>
+diff --git a/test/webui/torrentliststate.test.mjs b/test/webui/torrentliststate.test.mjs
+new file mode 100644
+index 0000000..f6ce7a2
+--- /dev/null
++++ b/test/webui/torrentliststate.test.mjs
+@@ -0,0 +1,93 @@
++import assert from "node:assert/strict";
++import path from "node:path";
++import test from "node:test";
++import {fileURLToPath, pathToFileURL} from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const modulePath = path.resolve(__dirname, "../../src/webui/www/private/scripts/torrent-list-state.js");
++
++async function loadApi() {
++    try {
++        const imported = await import(pathToFileURL(modulePath).href);
++        return imported.default ?? imported;
++    }
++    catch (error) {
++        if ((error.code === "ERR_MODULE_NOT_FOUND") || (error.code === "MODULE_NOT_FOUND"))
++            return {};
++        throw error;
++    }
++}
++
++test("buildRowOrderState indexes rows by logical order", async () => {
++    const api = await loadApi();
++
++    assert.equal(typeof api.buildRowOrderState, "function");
++
++    const state = api.buildRowOrderState([
++        {rowId: "torrent-c", full_data: {name: "C"}},
++        {rowId: "torrent-a", full_data: {name: "A"}},
++        {rowId: "torrent-b", full_data: {name: "B"}}
++    ]);
++
++    assert.deepEqual(state.rowIds, ["torrent-c", "torrent-a", "torrent-b"]);
++    assert.equal(state.rowIndexById["torrent-c"], 0);
++    assert.equal(state.rowIndexById["torrent-b"], 2);
++    assert.equal(state.rowsById["torrent-a"].full_data.name, "A");
++});
++
++test("getRangeSelection follows logical row order regardless of endpoint order", async () => {
++    const api = await loadApi();
++
++    assert.equal(typeof api.buildRowOrderState, "function");
++    assert.equal(typeof api.getRangeSelection, "function");
++
++    const state = api.buildRowOrderState([
++        {rowId: "a"},
++        {rowId: "b"},
++        {rowId: "c"},
++        {rowId: "d"}
++    ]);
++
++    assert.deepEqual(api.getRangeSelection(state, "b", "d"), ["b", "c", "d"]);
++    assert.deepEqual(api.getRangeSelection(state, "d", "b"), ["b", "c", "d"]);
++});
++
++test("getAdjacentRowId preserves current keyboard navigation semantics", async () => {
++    const api = await loadApi();
++
++    assert.equal(typeof api.buildRowOrderState, "function");
++    assert.equal(typeof api.getAdjacentRowId, "function");
++
++    const state = api.buildRowOrderState([
++        {rowId: "a"},
++        {rowId: "b"},
++        {rowId: "c"}
++    ]);
++
++    assert.equal(api.getAdjacentRowId(state, "a", 1), "b");
++    assert.equal(api.getAdjacentRowId(state, "b", -1), "a");
++    assert.equal(api.getAdjacentRowId(state, "missing", 1), "a");
++    assert.equal(api.getAdjacentRowId(state, "missing", -1), null);
++    assert.equal(api.getAdjacentRowId(state, "c", 1), null);
++});
++
++test("calculateWindowRange computes bounded virtual window and spacer heights", async () => {
++    const api = await loadApi();
++
++    assert.equal(typeof api.calculateWindowRange, "function");
++
++    const range = api.calculateWindowRange({
++        totalRows: 100,
++        rowHeight: 20,
++        scrollTop: 40,
++        viewportHeight: 60,
++        overscan: 2
++    });
++
++    assert.deepEqual(range, {
++        startIndex: 0,
++        endIndex: 6,
++        topSpacerHeight: 0,
++        bottomSpacerHeight: 1860
++    });
++});
+-- 
+2.34.1

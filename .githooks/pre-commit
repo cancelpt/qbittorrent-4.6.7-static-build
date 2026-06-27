@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "${repo_root}"
+
+run_privacy_scan() {
+    local -a files=()
+    local -a patterns=(
+        "/home/ryan"
+        "/mnt/c/Users/"
+        "C:\\\\Users\\\\"
+        "/Users/"
+        "ryan@localhost"
+        "Codex <codex@local\\.invalid>"
+        "qihe"
+        "qdirected-bench"
+        "browser-forge"
+        "dut-upstream-corpus"
+    )
+    local path
+
+    while IFS= read -r -d '' path; do
+        case "${path}" in
+            .githooks/*)
+                continue
+                ;;
+        esac
+        files+=("${path}")
+    done < <(git ls-files -z)
+
+    ((${#files[@]})) || return 0
+
+    local pattern matches
+    for pattern in "${patterns[@]}"; do
+        matches="$(grep -nI -H -E -- "${pattern}" "${files[@]}" || true)"
+        if [[ -n "${matches}" ]]; then
+            printf 'privacy scan failed for pattern %s\n%s\n' "${pattern}" "${matches}" >&2
+            exit 1
+        fi
+    done
+}
+
+# The patch payloads preserve upstream formatting, so skip them here.
+git diff --check --cached -- . ':(exclude)packaging/qbt-static/patches/**'
+bash -n \
+    packaging/qbt-static/run-static-build.sh \
+    packaging/qbt-static/in-container-build.sh \
+    packaging/qbt-static/stage-release-assets.sh
+python3 -m pytest tests/test_qbt_static_wrapper.py -q
+run_privacy_scan
