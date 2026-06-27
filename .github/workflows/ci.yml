@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify-wrapper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install repository test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y patch rsync
+          python3 -m pip install --upgrade pip pytest
+
+      - name: Validate shell scripts
+        run: |
+          bash -n packaging/qbt-static/run-static-build.sh
+          bash -n packaging/qbt-static/in-container-build.sh
+          bash -n packaging/qbt-static/stage-release-assets.sh
+
+      - name: Run repository tests
+        run: python3 -m pytest tests/test_qbt_static_wrapper.py -q

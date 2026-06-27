@@ -1,0 +1,24 @@
+From ac37db5cf7f4609412eb35fb38d4ecf2d1deded0 Mon Sep 17 00:00:00 2001
+From: cancelpt <cancelpt@gmail.com>
+Date: Sun, 26 Apr 2026 05:06:47 +0800
+Subject: [PATCH 3/4] feat: bound libtorrent alert queue size
+
+---
+ src/base/bittorrent/sessionimpl.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 7ef150c..6b7df8e 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -1842,7 +1842,7 @@ lt::settings_pack SessionImpl::loadLTSettings() const
+     settingsPack.set_int(lt::settings_pack::active_tracker_limit, -1);
+     settingsPack.set_int(lt::settings_pack::active_dht_limit, -1);
+     settingsPack.set_int(lt::settings_pack::active_lsd_limit, -1);
+-    settingsPack.set_int(lt::settings_pack::alert_queue_size, std::numeric_limits<int>::max() / 2);
++    settingsPack.set_int(lt::settings_pack::alert_queue_size, Preferences::instance()->sessionAlertQueueSize());
+ 
+     // Outgoing ports
+     settingsPack.set_int(lt::settings_pack::outgoing_port, outgoingPortsMin());
+-- 
+2.34.1

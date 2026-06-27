@@ -1,0 +1,263 @@
+From 2cee6e1c6b9adbfb5f4d125dbf7de0b83ae0c4c6 Mon Sep 17 00:00:00 2001
+From: cancelpt <cancelpt@gmail.com>
+Date: Sat, 2 May 2026 04:27:06 +0800
+Subject: [PATCH 5/5] feat: narrow steady-state payload policy
+
+---
+ src/base/CMakeLists.txt                  |   1 +
+ src/base/bittorrent/sessionimpl.cpp      |   3 +-
+ src/base/bittorrent/torrentimpl.cpp      |   8 +-
+ src/base/bittorrent/torrentstatusquery.h |  50 ++++++++++
+ test/CMakeLists.txt                      |   1 +
+ test/testtorrentstatusquery.cpp          | 112 +++++++++++++++++++++++
+ 6 files changed, 171 insertions(+), 4 deletions(-)
+ create mode 100644 src/base/bittorrent/torrentstatusquery.h
+ create mode 100644 test/testtorrentstatusquery.cpp
+
+diff --git a/src/base/CMakeLists.txt b/src/base/CMakeLists.txt
+index 5c7b10c..d43953d 100644
+--- a/src/base/CMakeLists.txt
++++ b/src/base/CMakeLists.txt
+@@ -39,6 +39,7 @@ add_library(qbt_base STATIC
+     bittorrent/torrentcreatorthread.h
+     bittorrent/torrentimpl.h
+     bittorrent/torrentinfo.h
++    bittorrent/torrentstatusquery.h
+     bittorrent/tracker.h
+     bittorrent/trackerentry.h
+     digest32.h
+diff --git a/src/base/bittorrent/sessionimpl.cpp b/src/base/bittorrent/sessionimpl.cpp
+index 4bcab69..e486e6f 100644
+--- a/src/base/bittorrent/sessionimpl.cpp
++++ b/src/base/bittorrent/sessionimpl.cpp
+@@ -109,6 +109,7 @@
+ #include "portforwarderimpl.h"
+ #include "resumedatastorage.h"
+ #include "torrentimpl.h"
++#include "torrentstatusquery.h"
+ #include "tracker.h"
+ 
+ using namespace std::chrono_literals;
+@@ -5405,7 +5406,7 @@ void SessionImpl::enqueueRefresh()
+ 
+     QTimer::singleShot(refreshInterval(), Qt::CoarseTimer, this, [this]
+     {
+-        m_nativeSession->post_torrent_updates();
++        m_nativeSession->post_torrent_updates(TorrentStatusQuery::steadyStateRefreshFlags());
+         m_nativeSession->post_session_stats();
+ 
+         if (m_torrentsQueueChanged)
+diff --git a/src/base/bittorrent/torrentimpl.cpp b/src/base/bittorrent/torrentimpl.cpp
+index f2311b2..44a1f31 100644
+--- a/src/base/bittorrent/torrentimpl.cpp
++++ b/src/base/bittorrent/torrentimpl.cpp
+@@ -68,6 +68,7 @@
+ #include "peeraddress.h"
+ #include "peerinfo.h"
+ #include "sessionimpl.h"
++#include "torrentstatusquery.h"
+ 
+ using namespace BitTorrent;
+ 
+@@ -1649,9 +1650,10 @@ TrackerEntry TorrentImpl::updateTrackerEntry(const lt::announce_entry &announceE
+ 
+ std::shared_ptr<const libtorrent::torrent_info> TorrentImpl::nativeTorrentInfo() const
+ {
+-    if (m_nativeStatus.torrent_file.expired())
+-        m_nativeStatus.torrent_file = m_nativeHandle.torrent_file();
+-    return m_nativeStatus.torrent_file.lock();
++    return TorrentStatusQuery::resolveNativeTorrentInfo(m_nativeStatus.torrent_file, [this]
++    {
++        return m_nativeHandle.torrent_file();
++    });
+ }
+ 
+ void TorrentImpl::endReceivedMetadataHandling(const Path &savePath, const PathList &fileNames)
+diff --git a/src/base/bittorrent/torrentstatusquery.h b/src/base/bittorrent/torrentstatusquery.h
+new file mode 100644
+index 0000000..e34130f
+--- /dev/null
++++ b/src/base/bittorrent/torrentstatusquery.h
+@@ -0,0 +1,50 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ */
++
++#ifndef QBT_BITTORRENT_TORRENTSTATUSQUERY_H
++#define QBT_BITTORRENT_TORRENTSTATUSQUERY_H
++
++#include <memory>
++#include <utility>
++
++#include <libtorrent/torrent_handle.hpp>
++#include <libtorrent/torrent_info.hpp>
++
++namespace BitTorrent::TorrentStatusQuery
++{
++    inline libtorrent::status_flags_t steadyStateRefreshFlags()
++    {
++        using TorrentHandle = libtorrent::torrent_handle;
++
++        // Keep the optional fields still consumed on qB's steady-state path,
++        // while excluding the heavier payloads that do not need to ride along
++        // with every periodic state_update_alert.
++        return (TorrentHandle::query_accurate_download_counters
++                | TorrentHandle::query_distributed_copies
++                | TorrentHandle::query_last_seen_complete
++                | TorrentHandle::query_name
++                | TorrentHandle::query_pieces
++                | TorrentHandle::query_save_path);
++    }
++
++    template <typename Loader>
++    std::shared_ptr<const libtorrent::torrent_info> resolveNativeTorrentInfo(
++            std::weak_ptr<const libtorrent::torrent_info> &cachedTorrentInfo, Loader &&loadTorrentInfo)
++    {
++        if (std::shared_ptr<const libtorrent::torrent_info> torrentInfo = cachedTorrentInfo.lock())
++            return torrentInfo;
++
++        std::shared_ptr<const libtorrent::torrent_info> torrentInfo = std::forward<Loader>(loadTorrentInfo)();
++        cachedTorrentInfo = torrentInfo;
++        return torrentInfo;
++    }
++}
++
++#endif // QBT_BITTORRENT_TORRENTSTATUSQUERY_H
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 1915886..0cb2889 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -16,6 +16,7 @@ set(testFiles
+     testhttpresponsegenerator.cpp
+     testorderedset.cpp
+     testpath.cpp
++    testtorrentstatusquery.cpp
+     testpreferences.cpp
+     testwebuimaindatasync.cpp
+     testutilscompare.cpp
+diff --git a/test/testtorrentstatusquery.cpp b/test/testtorrentstatusquery.cpp
+new file mode 100644
+index 0000000..6d45806
+--- /dev/null
++++ b/test/testtorrentstatusquery.cpp
+@@ -0,0 +1,112 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ */
++
++#include <memory>
++
++#include <libtorrent/create_torrent.hpp>
++#include <libtorrent/file_storage.hpp>
++#include <libtorrent/torrent_handle.hpp>
++#include <libtorrent/torrent_info.hpp>
++
++#include <QTest>
++
++#include "base/bittorrent/torrentstatusquery.h"
++
++using namespace BitTorrent;
++
++namespace
++{
++    std::shared_ptr<const lt::torrent_info> makeTorrentInfo()
++    {
++        lt::file_storage storage;
++        storage.add_file("payload.bin", 16 * 1024);
++
++        lt::create_torrent torrent {storage, 16 * 1024};
++        torrent.set_creator("qbt-test");
++
++        std::vector<char> encoded;
++        lt::bencode(std::back_inserter(encoded), torrent.generate());
++
++        return std::make_shared<lt::torrent_info>(encoded, lt::from_span);
++    }
++}
++
++class TestTorrentStatusQuery final : public QObject
++{
++    Q_OBJECT
++    Q_DISABLE_COPY_MOVE(TestTorrentStatusQuery)
++
++public:
++    TestTorrentStatusQuery() = default;
++
++private slots:
++    void steadyStateRefreshFlagsExcludeHeavyOptionalFields() const
++    {
++        const lt::status_flags_t flags = TorrentStatusQuery::steadyStateRefreshFlags();
++
++        QVERIFY(flags & lt::torrent_handle::query_pieces);
++        QVERIFY(flags & lt::torrent_handle::query_name);
++        QVERIFY(flags & lt::torrent_handle::query_save_path);
++        QVERIFY(flags & lt::torrent_handle::query_distributed_copies);
++        QVERIFY(flags & lt::torrent_handle::query_accurate_download_counters);
++        QVERIFY(flags & lt::torrent_handle::query_last_seen_complete);
++
++        QVERIFY(!(flags & lt::torrent_handle::query_verified_pieces));
++        QVERIFY(!(flags & lt::torrent_handle::query_torrent_file));
++    }
++
++    void resolveNativeTorrentInfoUsesCachedValueWithoutLoader() const
++    {
++        const std::shared_ptr<const lt::torrent_info> expectedTorrentInfo = makeTorrentInfo();
++        std::weak_ptr<const lt::torrent_info> cachedTorrentInfo = expectedTorrentInfo;
++        int loaderCallCount = 0;
++
++        const std::shared_ptr<const lt::torrent_info> resolvedTorrentInfo
++            = TorrentStatusQuery::resolveNativeTorrentInfo(cachedTorrentInfo, [&loaderCallCount]() -> std::shared_ptr<const lt::torrent_info>
++        {
++            ++loaderCallCount;
++            return {};
++        });
++
++        QCOMPARE(loaderCallCount, 0);
++        QCOMPARE(resolvedTorrentInfo.get(), expectedTorrentInfo.get());
++        QCOMPARE(cachedTorrentInfo.lock().get(), expectedTorrentInfo.get());
++    }
++
++    void resolveNativeTorrentInfoLoadsAndCachesValueOnDemand() const
++    {
++        std::weak_ptr<const lt::torrent_info> cachedTorrentInfo;
++        int loaderCallCount = 0;
++        const std::shared_ptr<const lt::torrent_info> expectedTorrentInfo = makeTorrentInfo();
++
++        const std::shared_ptr<const lt::torrent_info> resolvedTorrentInfo
++            = TorrentStatusQuery::resolveNativeTorrentInfo(cachedTorrentInfo, [&loaderCallCount, &expectedTorrentInfo]() -> std::shared_ptr<const lt::torrent_info>
++        {
++            ++loaderCallCount;
++            return expectedTorrentInfo;
++        });
++
++        QCOMPARE(loaderCallCount, 1);
++        QCOMPARE(resolvedTorrentInfo.get(), expectedTorrentInfo.get());
++        QCOMPARE(cachedTorrentInfo.lock().get(), expectedTorrentInfo.get());
++    }
++};
++
++QTEST_APPLESS_MAIN(TestTorrentStatusQuery)
++#include "testtorrentstatusquery.moc"
+-- 
+2.34.1

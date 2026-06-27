@@ -1,0 +1,158 @@
+From 6d85fdaeed8b2ee4f3788f0aa3aa83fda44e2b7e Mon Sep 17 00:00:00 2001
+From: cancelpt <cancelpt@gmail.com>
+Date: Sun, 26 Apr 2026 04:52:00 +0800
+Subject: [PATCH 1/4] Add session alert queue size preference getter and tests
+
+---
+ src/base/preferences.cpp |  6 +++
+ src/base/preferences.h   |  1 +
+ test/CMakeLists.txt      |  1 +
+ test/testpreferences.cpp | 96 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 104 insertions(+)
+ create mode 100644 test/testpreferences.cpp
+
+diff --git a/src/base/preferences.cpp b/src/base/preferences.cpp
+index 4555247..4f3575a 100644
+--- a/src/base/preferences.cpp
++++ b/src/base/preferences.cpp
+@@ -332,6 +332,12 @@ void Preferences::setBdecodeTokenLimit(const int value)
+     setValue(u"BitTorrent/BdecodeTokenLimit"_s, value);
+ }
+ 
++int Preferences::sessionAlertQueueSize() const
++{
++    const int queueSize = value<int>(u"BitTorrent/SessionAlertQueueSize"_s, 10'000);
++    return ((queueSize >= 100) ? queueSize : 100);
++}
++
+ bool Preferences::isToolbarDisplayed() const
+ {
+     return value(u"Preferences/General/ToolbarDisplayed"_s, true);
+diff --git a/src/base/preferences.h b/src/base/preferences.h
+index fe19d93..e328dcc 100644
+--- a/src/base/preferences.h
++++ b/src/base/preferences.h
+@@ -332,6 +332,7 @@ public:
+     void setBdecodeDepthLimit(int value);
+     int getBdecodeTokenLimit() const;
+     void setBdecodeTokenLimit(int value);
++    int sessionAlertQueueSize() const;
+ 
+     // Stuff that don't appear in the Options GUI but are saved
+     // in the same file.
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 611e7f9..bf358c1 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -15,6 +15,7 @@ set(testFiles
+     testglobal.cpp
+     testorderedset.cpp
+     testpath.cpp
++    testpreferences.cpp
+     testutilscompare.cpp
+     testutilsbytearray.cpp
+     testutilsgzip.cpp
+diff --git a/test/testpreferences.cpp b/test/testpreferences.cpp
+new file mode 100644
+index 0000000..7e9ef40
+--- /dev/null
++++ b/test/testpreferences.cpp
+@@ -0,0 +1,96 @@
++/*
++ * Bittorrent Client using Qt and libtorrent.
++ * Copyright (C) 2026
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * as published by the Free Software Foundation; either version 2
++ * of the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
++ *
++ * In addition, as a special exception, the copyright holders give permission to
++ * link this program with the OpenSSL project's "OpenSSL" library (or with
++ * modified versions of it that use the same license as the "OpenSSL" library),
++ * and distribute the linked executables. You must obey the GNU General Public
++ * License in all respects for all of the code used other than "OpenSSL".  If you
++ * modify file(s), you may extend this exception to your version of the file(s),
++ * but you are not obligated to do so. If you do not wish to do so, delete this
++ * exception statement from your version.
++ */
++
++#include <QTemporaryDir>
++#include <QTest>
++
++#include "base/global.h"
++#include "base/path.h"
++#include "base/preferences.h"
++#include "base/profile.h"
++#include "base/settingsstorage.h"
++
++class TestPreferences final : public QObject
++{
++    Q_OBJECT
++    Q_DISABLE_COPY_MOVE(TestPreferences)
++
++public:
++    TestPreferences() = default;
++
++private slots:
++    void initTestCase()
++    {
++        QVERIFY(m_profileDir.isValid());
++
++        Profile::initInstance(Path(m_profileDir.path()), u"testpreferences"_s, false);
++        SettingsStorage::initInstance();
++        Preferences::initInstance();
++    }
++
++    void cleanupTestCase()
++    {
++        Preferences::freeInstance();
++        SettingsStorage::freeInstance();
++        Profile::freeInstance();
++    }
++
++    void init()
++    {
++        SettingsStorage::instance()->removeValue(u"BitTorrent/SessionAlertQueueSize"_s);
++    }
++
++    void missingSessionAlertQueueSizeUsesDefault() const
++    {
++        QCOMPARE(Preferences::instance()->sessionAlertQueueSize(), 10'000);
++    }
++
++    void configuredSessionAlertQueueSizeIsUsed() const
++    {
++        SettingsStorage::instance()->storeValue(u"BitTorrent/SessionAlertQueueSize"_s, 4321);
++        QCOMPARE(Preferences::instance()->sessionAlertQueueSize(), 4321);
++    }
++
++    void zeroSessionAlertQueueSizeIsClamped() const
++    {
++        SettingsStorage::instance()->storeValue(u"BitTorrent/SessionAlertQueueSize"_s, 0);
++        QCOMPARE(Preferences::instance()->sessionAlertQueueSize(), 100);
++    }
++
++    void negativeSessionAlertQueueSizeIsClamped() const
++    {
++        SettingsStorage::instance()->storeValue(u"BitTorrent/SessionAlertQueueSize"_s, -3);
++        QCOMPARE(Preferences::instance()->sessionAlertQueueSize(), 100);
++    }
++
++private:
++    QTemporaryDir m_profileDir;
++};
++
++QTEST_APPLESS_MAIN(TestPreferences)
++#include "testpreferences.moc"
+-- 
+2.34.1
