@@ -151,6 +151,18 @@ if tag_idx is None:
     raise SystemExit("missing expected libtorrent tag override branch in upstream script")
 lines[tag_idx] = '\t\t\t\tgithub_tag[libtorrent]="$2"'
 
+qbt_tag_idx = next(
+    (
+        idx
+        for idx, line in enumerate(lines)
+        if line == '\t\t\t\tgithub_tag[qbittorrent]="$(_git "${github_url[qbittorrent]}" -t "$2")"'
+    ),
+    None,
+)
+if qbt_tag_idx is None:
+    raise SystemExit("missing expected qbittorrent tag override branch in upstream script")
+lines[qbt_tag_idx] = '\t\t\t\tgithub_tag[qbittorrent]="$2"'
+
 qtbase_feature_idx = next(
     (
         idx

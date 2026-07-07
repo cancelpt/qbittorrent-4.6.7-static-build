@@ -1,0 +1,503 @@
+From 1a9ff0120fdec528a1c24e28f62e4d1d7cfb197c Mon Sep 17 00:00:00 2001
+From: cancelpt <cancelpt@gmail.com>
+Date: Tue, 7 Jul 2026 00:54:08 +0800
+Subject: [PATCH 6/6] fix(webui): preserve virtual scroll on full update
+
+---
+ src/webui/www/private/scripts/client.js       |   6 +-
+ src/webui/www/private/scripts/dynamicTable.js |  65 +++++++
+ test/webui/client-fullupdate-order.test.mjs   |  70 +++++++
+ .../webui/dynamictable-browser-smoke.test.mjs | 175 ++++++++++++++++++
+ .../virtualized-torrent-list-browser.html     |  85 +++++++++
+ 5 files changed, 400 insertions(+), 1 deletion(-)
+ create mode 100644 test/webui/client-fullupdate-order.test.mjs
+
+diff --git a/src/webui/www/private/scripts/client.js b/src/webui/www/private/scripts/client.js
+index d9fdc77..019d707 100644
+--- a/src/webui/www/private/scripts/client.js
++++ b/src/webui/www/private/scripts/client.js
+@@ -661,12 +661,14 @@ window.addEvent('load', function() {
+                     torrentsFilterInputTimer = -1;
+ 
+                     let torrentsTableSelectedRows;
++                    let preservedViewportState = null;
+                     let update_categories = false;
+                     let updateTags = false;
+                     let updateTrackers = false;
+                     const full_update = (response['full_update'] === true);
+                     if (full_update) {
+                         torrentsTableSelectedRows = torrentsTable.selectedRowsIds();
++                        preservedViewportState = torrentsTable.captureViewportState();
+                         torrentsTable.clear();
+                         category_list = {};
+                         tagList = {};
+@@ -785,6 +787,8 @@ window.addEvent('load', function() {
+                             updateTags = true; // Always to update All tag
+                         });
+                     torrentsTable.updateTable(full_update);
++                    if (full_update)
++                        torrentsTable.restoreViewportState(preservedViewportState);
+                     torrentsTable.altRow();
+                     if (response['server_state']) {
+                         const tmp = response['server_state'];
+@@ -806,7 +810,7 @@ window.addEvent('load', function() {
+ 
+                     if (full_update)
+                         // re-select previously selected rows
+-                        torrentsTable.reselectRows(torrentsTableSelectedRows);
++                        torrentsTable.reselectRows(torrentsTable.filterExistingRowIds(torrentsTableSelectedRows));
+                 }
+                 syncRequestInProgress = false;
+                 syncData(getSyncMainDataInterval());
+diff --git a/src/webui/www/private/scripts/dynamicTable.js b/src/webui/www/private/scripts/dynamicTable.js
+index 5c76577..1555d99 100644
+--- a/src/webui/www/private/scripts/dynamicTable.js
++++ b/src/webui/www/private/scripts/dynamicTable.js
+@@ -705,6 +705,71 @@ window.qBittorrent.DynamicTable = (function() {
+                 this.virtualRefreshFrameId = setTimeout(refresh, 0);
+         },
+ 
++        captureViewportState: function() {
++            const tableDiv = $(this.dynamicTableDivId);
++            if (!tableDiv)
++                return null;
++
++            return {
++                scrollTop: tableDiv.scrollTop || 0,
++                clientHeight: tableDiv.clientHeight || 0,
++                scrollHeight: tableDiv.scrollHeight || 0
++            };
++        },
++
++        restoreViewportState: function(viewportState) {
++            const tableDiv = $(this.dynamicTableDivId);
++            if (!viewportState || !tableDiv)
++                return null;
++
++            const cancelPendingRefresh = function() {
++                if (this.virtualRefreshFrameId === null)
++                    return;
++
++                if (typeof window.cancelAnimationFrame === 'function')
++                    window.cancelAnimationFrame(this.virtualRefreshFrameId);
++                clearTimeout(this.virtualRefreshFrameId);
++                this.virtualRefreshFrameId = null;
++            }.bind(this);
++
++            cancelPendingRefresh();
++
++            const savedScrollTop = Number.parseInt(viewportState.scrollTop, 10);
++            const maxScrollTop = Math.max(0, (tableDiv.scrollHeight || 0) - (tableDiv.clientHeight || 0));
++            const clampedScrollTop = Math.min(Math.max(Number.isFinite(savedScrollTop) ? savedScrollTop : 0, 0), maxScrollTop);
++
++            tableDiv.scrollTop = clampedScrollTop;
++            cancelPendingRefresh();
++            this.refreshVirtualTableWindow(false);
++
++            return {
++                scrollTop: tableDiv.scrollTop || 0,
++                clientHeight: tableDiv.clientHeight || 0,
++                scrollHeight: tableDiv.scrollHeight || 0,
++                maxScrollTop: maxScrollTop
++            };
++        },
++
++        filterExistingRowIds: function(rowIds) {
++            const filteredRowIds = [];
++            if (!rowIds)
++                return filteredRowIds;
++
++            const rowIndexById = this.rowOrderState ? this.rowOrderState.rowIndexById : null;
++            for (let i = 0; i < rowIds.length; ++i) {
++                const rowId = `${rowIds[i]}`;
++                if (rowIndexById) {
++                    if (rowIndexById[rowId] !== undefined)
++                        filteredRowIds.push(rowId);
++                }
++                else if (this.rows && this.rows.has(rowId)) {
++                    filteredRowIds.push(rowId);
++                }
++            }
++
++            return filteredRowIds;
++        },
++
+         assignRowIdentity: function(tr, rowId) {
+             tr.setProperty("data-row-id", rowId);
+             tr['rowId'] = rowId;
+diff --git a/test/webui/client-fullupdate-order.test.mjs b/test/webui/client-fullupdate-order.test.mjs
+new file mode 100644
+index 0000000..818900f
+--- /dev/null
++++ b/test/webui/client-fullupdate-order.test.mjs
+@@ -0,0 +1,70 @@
++import assert from "node:assert/strict";
++import fs from "node:fs";
++import path from "node:path";
++import test from "node:test";
++import {fileURLToPath} from "node:url";
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const repoRoot = path.resolve(__dirname, "../..");
++const clientSourcePath = path.join(repoRoot, "src/webui/www/private/scripts/client.js");
++
++const clientSource = fs.readFileSync(clientSourcePath, "utf8");
++
++const findRequired = (source, needle, label, fromIndex = 0) => {
++    const index = source.indexOf(needle, fromIndex);
++    assert.notEqual(index, -1, `expected ${label} in full_update lifecycle`);
++    return index;
++};
++
++test("client full_update preserves viewport before reselecting rows", () => {
++    const fullUpdateStart = findRequired(
++        clientSource,
++        "const full_update = (response['full_update'] === true);",
++        "full_update branch");
++    const fullUpdateEnd = findRequired(
++        clientSource,
++        "syncRequestInProgress = false;",
++        "end of sync success handler",
++        fullUpdateStart);
++    const fullUpdateLifecycle = clientSource.slice(fullUpdateStart, fullUpdateEnd);
++
++    const selectedRowsIndex = findRequired(
++        fullUpdateLifecycle,
++        "torrentsTable.selectedRowsIds()",
++        "selectedRowsIds() capture");
++    const captureViewportIndex = findRequired(
++        fullUpdateLifecycle,
++        "torrentsTable.captureViewportState()",
++        "captureViewportState() before clear()");
++    const clearIndex = findRequired(
++        fullUpdateLifecycle,
++        "torrentsTable.clear()",
++        "clear() after viewport capture");
++    const updateTableIndex = findRequired(
++        fullUpdateLifecycle,
++        "torrentsTable.updateTable(full_update)",
++        "updateTable(full_update) after rebuild");
++    const restoreViewportIndex = findRequired(
++        fullUpdateLifecycle,
++        "torrentsTable.restoreViewportState(",
++        "restoreViewportState() after updateTable(full_update)");
++
++    assert.ok(
++        selectedRowsIndex < captureViewportIndex,
++        "selectedRowsIds() must happen before captureViewportState()");
++    assert.ok(
++        captureViewportIndex < clearIndex,
++        "captureViewportState() must happen before clear()");
++    assert.ok(
++        clearIndex < updateTableIndex,
++        "clear() must happen before updateTable(full_update)");
++    assert.ok(
++        updateTableIndex < restoreViewportIndex,
++        "updateTable(full_update) must happen before restoreViewportState()");
++
++    const restoreAndReselect = fullUpdateLifecycle.slice(restoreViewportIndex);
++    assert.match(
++        restoreAndReselect,
++        /torrentsTable\.reselectRows\s*\(\s*torrentsTable\.filterExistingRowIds\s*\(\s*torrentsTableSelectedRows\s*\)\s*\)/,
++        "restoreViewportState() must be followed by reselectRows(filterExistingRowIds(torrentsTableSelectedRows))");
++});
+diff --git a/test/webui/dynamictable-browser-smoke.test.mjs b/test/webui/dynamictable-browser-smoke.test.mjs
+index af7b868..06424cd 100644
+--- a/test/webui/dynamictable-browser-smoke.test.mjs
++++ b/test/webui/dynamictable-browser-smoke.test.mjs
+@@ -14,6 +14,13 @@ const fixtureUrlPath = "/test/webui/fixtures/virtualized-torrent-list-browser.ht
+ const requireFromSmokeWorkspace = createRequire("/tmp/qbt-webui-browser-smoke/package.json");
+ const {chromium} = requireFromSmokeWorkspace("playwright-chromium");
+ 
++const rowHeight = 20;
++const viewportHeight = 60;
++const hiddenHeaderHeight = 20;
++const scrollTopForIndex = (index) => index * rowHeight;
++const scrollHeightForRows = (rowCount) => hiddenHeaderHeight + (rowCount * rowHeight);
++const maxScrollTopForRows = (rowCount) => Math.max(0, scrollHeightForRows(rowCount) - viewportHeight);
++
+ let server;
+ let browser;
+ let baseUrl;
+@@ -81,6 +88,174 @@ async function openSmokePage() {
+     return page;
+ }
+ 
++async function loadAndScroll(page, rowCount, rowIndex) {
++    await page.evaluate((count) => window.browserSmokeApi.loadTorrents(count), rowCount);
++    await page.evaluate((index) => window.browserSmokeApi.scrollToIndex(index), rowIndex);
++    const state = await page.evaluate(() => window.browserSmokeApi.getTableState());
++    assert.equal(state.scrollTop, scrollTopForIndex(rowIndex));
++    return state;
++}
++
++test("full update preserves scroll without selection", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1500);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds([]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient());
++
++        assert.equal(state.scrollTop, scrollTopForIndex(1500));
++        assert.equal(state.clientHeight, viewportHeight);
++        assert.deepEqual(state.selectedRows, []);
++        assert.equal(state.windowRange.startIndex, 1498);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update preserves scroll with top-row selection stored off-screen", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1500);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-0"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient());
++
++        assert.equal(state.scrollTop, scrollTopForIndex(1500));
++        assert.deepEqual(state.selectedRows, ["torrent-0"]);
++        assert.notEqual(state.firstMountedRowId, "torrent-0");
++        assert.equal(state.windowRange.startIndex, 1498);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update preserves scroll with mid-row selection", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1500);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-1500"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient());
++
++        assert.equal(state.scrollTop, scrollTopForIndex(1500));
++        assert.deepEqual(state.selectedRows, ["torrent-1500"]);
++        assert.equal(state.windowRange.startIndex, 1498);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update clamps scroll after row-count shrink", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 2500);
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient({
++            nextCount: 120
++        }));
++
++        assert.equal(state.scrollTop, maxScrollTopForRows(120));
++        assert.equal(state.scrollHeight, scrollHeightForRows(120));
++        assert.equal(state.windowRange.startIndex, 116);
++        assert.equal(state.windowRange.endIndex, 119);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update drops removed selected rows safely", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1500);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-1500", "torrent-1501"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient({
++            removedRowIds: ["torrent-1500"]
++        }));
++
++        assert.equal(state.scrollTop, scrollTopForIndex(1500));
++        assert.deepEqual(state.selectedRows, ["torrent-1501"]);
++        assert.ok(!state.mountedRows.includes("torrent-1500"));
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update with zero rows lands safely at scrollTop zero", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1500);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-1500"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient({
++            nextCount: 0
++        }));
++
++        assert.equal(state.scrollTop, 0);
++        assert.deepEqual(state.selectedRows, []);
++        assert.deepEqual(state.mountedRows, []);
++        assert.equal(state.windowRange.startIndex, 0);
++        assert.equal(state.windowRange.endIndex, -1);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("full update remains safe across sorting changes", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 700);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-42", "torrent-2999"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.fullUpdateLikeClient({
++            removedRowIds: ["torrent-42"],
++            reverseNameSort: true
++        }));
++
++        assert.equal(state.scrollTop, scrollTopForIndex(700));
++        assert.deepEqual(state.selectedRows, ["torrent-2999"]);
++        assert.equal(state.windowRange.startIndex, 698);
++    }
++    finally {
++        await page.close();
++    }
++});
++
++test("incremental refresh keeps existing virtual scroll behavior unchanged", async () => {
++    const page = await openSmokePage();
++
++    try {
++        await loadAndScroll(page, 3000, 1234);
++        await page.evaluate(() => window.browserSmokeApi.setSelectedRowIds(["torrent-1234"]));
++
++        const state = await page.evaluate(() => window.browserSmokeApi.incrementalRefresh({
++            updatedIndexes: [10, 1234],
++            activeIndexes: [1234]
++        }));
++
++        assert.equal(state.scrollTop, scrollTopForIndex(1234));
++        assert.deepEqual(state.selectedRows, ["torrent-1234"]);
++        assert.equal(state.windowRange.startIndex, 1232);
++    }
++    finally {
++        await page.close();
++    }
++});
++
+ test("browser smoke keeps torrent row DOM bounded and preserves selection interactions", async () => {
+     const page = await openSmokePage();
+ 
+diff --git a/test/webui/fixtures/virtualized-torrent-list-browser.html b/test/webui/fixtures/virtualized-torrent-list-browser.html
+index 0909042..fcf6efc 100644
+--- a/test/webui/fixtures/virtualized-torrent-list-browser.html
++++ b/test/webui/fixtures/virtualized-torrent-list-browser.html
+@@ -226,8 +226,92 @@
+             await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+         };
+ 
++        const getTableState = function() {
++            const tableDiv = document.getElementById('torrentsTableDiv');
++            const mountedRows = torrentsTable.getDataRows().map(function(row) {
++                return row.rowId;
++            });
++            const windowRange = torrentsTable.virtualWindowRange
++                ? {
++                    startIndex: torrentsTable.virtualWindowRange.startIndex,
++                    endIndex: torrentsTable.virtualWindowRange.endIndex,
++                    topSpacerHeight: torrentsTable.virtualWindowRange.topSpacerHeight,
++                    bottomSpacerHeight: torrentsTable.virtualWindowRange.bottomSpacerHeight
++                }
++                : null;
++
++            return {
++                scrollTop: tableDiv.scrollTop,
++                clientHeight: tableDiv.clientHeight,
++                scrollHeight: tableDiv.scrollHeight,
++                selectedRows: torrentsTable.selectedRowsIds(),
++                firstMountedRowId: mountedRows.length > 0 ? mountedRows[0] : null,
++                mountedRows: mountedRows,
++                windowRange: windowRange
++            };
++        };
++
++        const setSelectedRowIds = function(rowIds) {
++            torrentsTable.selectedRows = rowIds.map(function(rowId) {
++                return `${rowId}`;
++            });
++            torrentsTable.setRowClass();
++        };
++
++        const fullUpdateLikeClient = function(options) {
++            options = options || {};
++            const currentCount = torrentsTable.getRowIds().length;
++            const nextCount = options.nextCount ?? currentCount;
++            const removedRowIds = new Set((options.removedRowIds || []).map(function(rowId) {
++                return `${rowId}`;
++            }));
++            const activeIndexes = new Set(options.activeIndexes || []);
++            const torrentsTableSelectedRows = torrentsTable.selectedRowsIds();
++            const preservedViewportState = torrentsTable.captureViewportState();
++
++            torrentsTable.clear();
++
++            if (options.reverseNameSort === true) {
++                torrentsTable.sortedColumn = torrentsTable.getColumnPos('name');
++                torrentsTable.reverseSort = '1';
++            }
++            else if (options.reverseNameSort === false) {
++                torrentsTable.sortedColumn = torrentsTable.getColumnPos('name');
++                torrentsTable.reverseSort = '0';
++            }
++
++            for (let index = 0; index < nextCount; ++index) {
++                const rowId = `torrent-${index}`;
++                if (!removedRowIds.has(rowId))
++                    torrentsTable.updateRowData(createTorrentData(index, activeIndexes.has(index)));
++            }
++
++            torrentsTable.updateTable(true);
++            torrentsTable.restoreViewportState(preservedViewportState);
++            torrentsTable.reselectRows(torrentsTable.filterExistingRowIds(torrentsTableSelectedRows));
++
++            return getTableState();
++        };
++
++        const incrementalRefresh = function(options) {
++            options = options || {};
++            const updatedIndexes = options.updatedIndexes || [];
++            const activeIndexes = new Set(options.activeIndexes || []);
++
++            for (let i = 0; i < updatedIndexes.length; ++i) {
++                const index = updatedIndexes[i];
++                torrentsTable.updateRowData(createTorrentData(index, activeIndexes.has(index)));
++            }
++
++            torrentsTable.updateTable(false);
++            return getTableState();
++        };
++
+         window.browserSmokeApi = {
+             loadTorrents: loadTorrents,
++            getTableState: getTableState,
++            setSelectedRowIds: setSelectedRowIds,
++            fullUpdateLikeClient: fullUpdateLikeClient,
+             getMountedRowCount: function() {
+                 return torrentsTable.getDataRows().length;
+             },
+@@ -257,6 +341,7 @@
+                 torrentsTable.reverseSort = '1';
+                 torrentsTable.updateTable(false);
+             },
++            incrementalRefresh: incrementalRefresh,
+             getFirstMountedRowId: function() {
+                 const rows = torrentsTable.getDataRows();
+                 return rows.length > 0 ? rows[0].rowId : null;
+-- 
+2.34.1
