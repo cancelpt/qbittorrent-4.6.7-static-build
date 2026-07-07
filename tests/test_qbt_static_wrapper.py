@@ -26,6 +26,7 @@ CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 COMPAT_PATCH = "9000-static-qt610-compat.diff"
 NARROW_PAYLOAD_PATCH = "0005-feat-narrow-steady-state-payload-policy.patch"
+FULL_UPDATE_SCROLL_PATCH = "0006-fix-preserve-virtual-scroll-on-full-update.patch"
 UPSTREAM_TEST_CMAKELISTS = """if (QT6)
     find_package(Qt6 REQUIRED COMPONENTS Test)
 else()
@@ -166,6 +167,12 @@ class QbtStaticWrapperTest(unittest.TestCase):
         staged_patch_names = sorted(path.name for path in PATCH_STAGE_DIR.glob("*.patch"))
         self.assertEqual(staged_patch_names, source_patch_names)
         self.assertIn(NARROW_PAYLOAD_PATCH, source_patch_names)
+        self.assertIn(FULL_UPDATE_SCROLL_PATCH, source_patch_names)
+        source_series = PATCH_SERIES.read_text(encoding="utf-8").splitlines()
+        staged_series = (PATCH_STAGE_DIR / "series").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(staged_series, source_series)
+        self.assertEqual(source_series.count(FULL_UPDATE_SCROLL_PATCH), 1, source_series)
+        self.assertEqual(source_series[-2:], [NARROW_PAYLOAD_PATCH, FULL_UPDATE_SCROLL_PATCH])
         self.assertTrue((PATCH_SOURCE_DIR / COMPAT_PATCH).is_file(), "missing isolated static-toolchain compatibility patch")
         self.assertTrue((PATCH_STAGE_DIR / COMPAT_PATCH).is_file(), "missing staged static-toolchain compatibility patch")
         self.assertTrue(
@@ -208,7 +215,7 @@ class QbtStaticWrapperTest(unittest.TestCase):
 
             self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
 
-    def test_python_rewrite_snippet_pins_glibc_and_libtorrent_tags(self) -> None:
+    def test_python_rewrite_snippet_pins_glibc_libtorrent_and_qb_tags(self) -> None:
         in_container_text = IN_CONTAINER.read_text(encoding="utf-8")
         match = re.search(r"<<'PY'\n(.*)\nPY", in_container_text, re.S)
         self.assertIsNotNone(match, "missing embedded python rewrite snippet")
@@ -221,6 +228,7 @@ class QbtStaticWrapperTest(unittest.TestCase):
                 '\t\tgithub_tag[glibc]="$(_git_git ls-remote -q -t --refs "${github_url[glibc]}" | awk \'/glibc-/{sub("refs/tags/", "");sub("(.*)(cvs|fedora)(.*)", ""); if($2 ~ /^glibc-[0-9]+\\.[0-9]+$/) print $2 }\' | awk \'!/^$/\' | sort -rV | head -n1)"',
                 '\tgithub_tag[libtorrent]="$(_git_git ls-remote -q -t --refs "${github_url[libtorrent]}" | awk \'/v1\\.2\\./{print $2}\' | sort -rV | head -n1)"',
                 '\t\t\t\tgithub_tag[libtorrent]="$(_git "${github_url[libtorrent]}" -t "$2")"',
+                '\t\t\t\tgithub_tag[qbittorrent]="$(_git "${github_url[qbittorrent]}" -t "$2")"',
                 '\t\t\t-D QT_FEATURE_gui=off -D QT_FEATURE_openssl_linked=on -D QT_FEATURE_dbus=off \\',
             ]
         ) + "\n"
@@ -245,6 +253,7 @@ class QbtStaticWrapperTest(unittest.TestCase):
         self.assertIn('if [[ -n ${qbt_libtorrent_tag} ]]; then', rewritten)
         self.assertIn('github_tag[libtorrent]="${qbt_libtorrent_tag}"', rewritten)
         self.assertIn('github_tag[libtorrent]="$2"', rewritten)
+        self.assertIn('github_tag[qbittorrent]="$2"', rewritten)
         self.assertIn("FEATURE_icu=OFF", rewritten)
         self.assertIn("FEATURE_system_proxies=OFF", rewritten)
         self.assertIn("FEATURE_sql_mysql=OFF", rewritten)
@@ -274,7 +283,9 @@ class QbtStaticWrapperTest(unittest.TestCase):
         self.assertIn("QBT_STATIC_GNU_MIRROR", in_container_text)
         self.assertIn("ftpmirror.gnu.org/gnu", in_container_text)
         self.assertIn('github_tag[libtorrent]="$2"', in_container_text)
+        self.assertIn('github_tag[qbittorrent]="$2"', in_container_text)
         self.assertIn("missing expected default libtorrent probe", in_container_text)
+        self.assertIn("missing expected qbittorrent tag override branch", in_container_text)
         self.assertIn("--retry-max-time 300", in_container_text)
         self.assertIn("Acquire::ForceIPv4", in_container_text)
         self.assertIn("resolve_libtorrent_inputs", in_container_text)

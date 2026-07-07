@@ -11,8 +11,10 @@ This directory contains the qBittorrent deltas applied by the static build wrapp
 - `0003-feat-bound-libtorrent-alert-queue-size.patch`
 - `0004-feat-share-WebUI-maindata-state-and-virtualize-torre.patch`
 - `0005-feat-narrow-steady-state-payload-policy.patch`
+- `0006-fix-preserve-virtual-scroll-on-full-update.patch`
 
 `0005` stays aligned with `packaging/qbt-source-overlays/lt-retention-narrow/`.
+`0006` preserves the virtualized WebUI torrent list scroll position across `full_update` rebuilds.
 
 `9000-static-qt610-compat.diff` is a separate static-toolchain compatibility diff and is not part of the main functional series.
 
