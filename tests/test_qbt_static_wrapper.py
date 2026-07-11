@@ -19,10 +19,14 @@ PATCH_STAGE_DIR = REPO_ROOT / "build" / "qbt-static" / "work" / "patches" / "qbi
 SOURCE_OVERRIDE_STAGE_DIR = PATCH_STAGE_DIR / "source"
 LT_RETENTION_OVERLAY_SOURCE_DIR = REPO_ROOT / "packaging" / "qbt-source-overlays" / "lt-retention-narrow"
 LT_RETENTION_OVERLAY_STAGE_DIR = REPO_ROOT / "build" / "qbt-static" / "work" / "source-overlays" / "lt-retention-narrow"
+STAGE_RELEASE_ASSETS = REPO_ROOT / "packaging" / "qbt-static" / "stage-release-assets.sh"
 COMPAT_PATCH = "9000-static-qt610-compat.diff"
 NARROW_PAYLOAD_PATCH = "0005-feat-narrow-steady-state-payload-policy.patch"
 FULL_UPDATE_SCROLL_PATCH = "0006-fix-preserve-virtual-scroll-on-full-update.patch"
 ALERT_QUEUE_ROLLBACK_PATCH = "0006-revert-alert-queue-to-stock-qb-policy.patch"
+PUBLIC_RELEASE_VERSION = "v4.6.7-lt1.2.20-r1"
+PUBLIC_RELEASE_ASSET_NAME = f"qbittorrent-nox-{PUBLIC_RELEASE_VERSION}-linux-x86_64-static"
+LEGACY_RELEASE_ASSET_NAME = "qbittorrent-nox-4.6.7-linux-x86_64-static"
 MEMORY_PROBE_SOURCE_MARKERS = {
     "src/base/preferences.cpp": (
         'value(u"BitTorrent/ExperimentalWebUIMemoryProbeEnabled"_s, false)',
@@ -142,6 +146,7 @@ class QbtStaticWrapperTest(unittest.TestCase):
 
         self.assertEqual(plan["container_image"], "buildpack-deps:noble")
         self.assertEqual(plan["qbittorrent_tag"], "release-4.6.7")
+        self.assertEqual(plan["public_release_version"], PUBLIC_RELEASE_VERSION)
         self.assertEqual(plan["preferred_libtorrent"], "1.2.20")
         self.assertEqual(plan["fallback_libtorrent"], "1.2.19")
         self.assertEqual(plan["qt_version"], "6")
@@ -237,6 +242,32 @@ class QbtStaticWrapperTest(unittest.TestCase):
         )
         self.assertIn(STOCK_ALERT_QUEUE_LINE, staged_sessionimpl_text)
         self.assertNotIn(BOUNDED_ALERT_QUEUE_LINE, staged_sessionimpl_text)
+
+    def test_stage_release_assets_uses_canonical_public_release_version_filename(self) -> None:
+        self.assertTrue(STAGE_RELEASE_ASSETS.is_file(), f"missing stage release script: {STAGE_RELEASE_ASSETS}")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            release_dir = tmp_path / "release"
+            source_binary = tmp_path / "qbittorrent-nox"
+            source_binary.write_text("fake-binary", encoding="utf-8")
+
+            result = subprocess.run(
+                ["bash", str(STAGE_RELEASE_ASSETS), str(release_dir), str(source_binary)],
+                check=True,
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.stdout.strip(), str(release_dir))
+            staged_binary = release_dir / PUBLIC_RELEASE_ASSET_NAME
+            self.assertTrue(staged_binary.is_file(), f"missing staged binary: {staged_binary}")
+            self.assertFalse((release_dir / LEGACY_RELEASE_ASSET_NAME).exists())
+
+            checksum_text = (release_dir / "SHA256SUMS").read_text(encoding="utf-8")
+            self.assertIn(PUBLIC_RELEASE_ASSET_NAME, checksum_text)
+            self.assertNotIn(LEGACY_RELEASE_ASSET_NAME, checksum_text)
 
     def test_narrow_payload_patch_dry_runs_after_prior_test_cmakelists_patches(self) -> None:
         file_relative_path = "test/CMakeLists.txt"
