@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Git tag to publish, for example v4.6.7
+        description: Existing Git tag to publish, for example v4.6.7-lt1.2.20-r1
         required: true
         type: string
 
@@ -68,6 +68,13 @@ jobs:
           bash -n packaging/qbt-static/stage-release-assets.sh
           python3 -m pytest tests/test_qbt_static_wrapper.py -q
 
+      - name: Load public release metadata
+        run: |
+          set -a
+          source packaging/qbt-static/config.env
+          set +a
+          printf 'QBT_STATIC_PUBLIC_RELEASE_VERSION=%s\n' "${QBT_STATIC_PUBLIC_RELEASE_VERSION}" >> "${GITHUB_ENV}"
+
       - name: Build static artifact
         run: bash packaging/qbt-static/run-static-build.sh build
 
@@ -104,6 +111,6 @@ jobs:
             gh release upload "${QBT_RELEASE_TAG}" "${release_dir}"/* --clobber
           else
             gh release create "${QBT_RELEASE_TAG}" "${release_dir}"/* \
-              --title "qBittorrent static ${QBT_RELEASE_TAG}" \
-              --notes "Static build wrapper release assets for ${QBT_RELEASE_TAG}."
+              --title "qBittorrent static ${QBT_STATIC_PUBLIC_RELEASE_VERSION}" \
+              --notes "Static build wrapper release assets for ${QBT_STATIC_PUBLIC_RELEASE_VERSION}."
           fi

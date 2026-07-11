@@ -1,5 +1,5 @@
 From 8f3f56085ee5398adcabfd7c7a1af6db785f9d64 Mon Sep 17 00:00:00 2001
-From: Codex <codex@local.invalid>
+From: cancelpt <cancelpt@gmail.com>
 Date: Wed, 8 Jul 2026 16:21:00 +0800
 Subject: [PATCH 6/6] revert: restore stock qB alert queue policy
 
@@ -17,8 +17,8 @@ index e486e6f..8ca15c0 100644
      settingsPack.set_int(lt::settings_pack::active_lsd_limit, -1);
 -    settingsPack.set_int(lt::settings_pack::alert_queue_size, Preferences::instance()->sessionAlertQueueSize());
 +    settingsPack.set_int(lt::settings_pack::alert_queue_size, std::numeric_limits<int>::max() / 2);
- 
+
      // Outgoing ports
      settingsPack.set_int(lt::settings_pack::outgoing_port, outgoingPortsMin());
--- 
+--
 2.34.1

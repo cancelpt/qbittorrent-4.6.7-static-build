@@ -41,6 +41,7 @@ plan = {
     "upstream_repo": os.environ["QBT_STATIC_UPSTREAM_REPO"],
     "upstream_ref": os.environ["QBT_STATIC_UPSTREAM_REF"],
     "qbittorrent_tag": os.environ["QBT_STATIC_QB_TAG"],
+    "public_release_version": os.environ["QBT_STATIC_PUBLIC_RELEASE_VERSION"],
     "preferred_libtorrent": os.environ["QBT_STATIC_LT_VERSION"],
     "fallback_libtorrent": os.environ["QBT_STATIC_LT_FALLBACK_VERSION"],
     "qt_version": os.environ["QBT_STATIC_QT_VERSION"],

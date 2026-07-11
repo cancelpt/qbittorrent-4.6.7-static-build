@@ -47,6 +47,7 @@ bash packaging/qbt-static/run-static-build.sh shell
 ## 构建基线
 
 - qBittorrent tag: `release-4.6.7`
+- 对外 release 版本: `v4.6.7-lt1.2.20-r1`
 - 首选 libtorrent: `1.2.20`
 - 回退 libtorrent: `1.2.19`
 - Qt 主线: `6`
@@ -87,11 +88,11 @@ build/qbt-static/output/qbittorrent-nox --version
 - `ci.yml`
   在每次 push 和 pull request 上运行 shell 语法检查，以及 `python3 -m pytest tests/test_qbt_static_wrapper.py -q`
 - `release.yml`
-  在 `v*` 标签或手动 `workflow_dispatch` 时触发，运行 `packaging/qbt-static/run-static-build.sh build`，通过 `packaging/qbt-static/stage-release-assets.sh` 暂存 release 附件，并发布 GitHub Release assets，而不是把二进制提交进 git
+  在 `v*` 标签或手动 `workflow_dispatch` 时触发，对外使用 `v4.6.7-lt1.2.20-r1` 这类 canonical tag，运行 `packaging/qbt-static/run-static-build.sh build`，通过 `packaging/qbt-static/stage-release-assets.sh` 暂存 release 附件，并发布 GitHub Release assets，而不是把二进制提交进 git
 
 Release 产物包含：
 
-- `qbittorrent-nox-4.6.7-linux-x86_64-static`
+- `qbittorrent-nox-v4.6.7-lt1.2.20-r1-linux-x86_64-static`
 - `SHA256SUMS`
 - 配置签名时生成的 `SHA256SUMS.asc`
 

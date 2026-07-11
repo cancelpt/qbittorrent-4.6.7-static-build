@@ -15,13 +15,18 @@ set -a
 source "${CONFIG_PATH}"
 set +a
 
-version="${QBT_STATIC_QB_TAG#release-}"
+public_release_version="${QBT_STATIC_PUBLIC_RELEASE_VERSION:-}"
 release_dir="${1:-${REPO_ROOT}/${QBT_STATIC_STATE_DIR}/release}"
 source_binary="${2:-${REPO_ROOT}/${QBT_STATIC_OUTPUT_DIR}/qbittorrent-nox}"
-staged_binary_name="qbittorrent-nox-${version}-linux-x86_64-static"
+staged_binary_name="qbittorrent-nox-${public_release_version}-linux-x86_64-static"
 staged_binary_path="${release_dir}/${staged_binary_name}"
 checksum_path="${release_dir}/SHA256SUMS"
 signature_path="${release_dir}/SHA256SUMS.asc"
+
+if [[ -z "${public_release_version}" ]]; then
+    printf 'missing QBT_STATIC_PUBLIC_RELEASE_VERSION in %s\n' "${CONFIG_PATH}" >&2
+    exit 1
+fi
 
 if [[ ! -f "${source_binary}" ]]; then
     printf 'missing built artifact: %s\n' "${source_binary}" >&2

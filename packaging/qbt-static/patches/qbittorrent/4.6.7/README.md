@@ -2,7 +2,7 @@
 
 Primary patch sources:
 
-- `/home/ryan/cancelpt/seedbox/.codex/qbt-persistent/seedbox-webui-prod-candidate`
+- repository-owned qB WebUI candidate export captured in this directory's `0001`-`0006` patch chain and `source/` override tree
 - `packaging/qbt-source-overlays/lt-retention-narrow`
 
 Source commits, in apply order, for the exported clean-worktree chain:
