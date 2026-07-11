@@ -1856,7 +1856,7 @@ lt::settings_pack SessionImpl::loadLTSettings() const
     settingsPack.set_int(lt::settings_pack::active_tracker_limit, -1);
     settingsPack.set_int(lt::settings_pack::active_dht_limit, -1);
     settingsPack.set_int(lt::settings_pack::active_lsd_limit, -1);
-    settingsPack.set_int(lt::settings_pack::alert_queue_size, Preferences::instance()->sessionAlertQueueSize());
+    settingsPack.set_int(lt::settings_pack::alert_queue_size, std::numeric_limits<int>::max() / 2);
 
     // Outgoing ports
     settingsPack.set_int(lt::settings_pack::outgoing_port, outgoingPortsMin());

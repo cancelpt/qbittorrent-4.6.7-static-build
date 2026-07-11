@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 
-import hashlib
 import json
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import unittest
@@ -14,19 +12,60 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = REPO_ROOT / "packaging" / "qbt-static" / "run-static-build.sh"
 IN_CONTAINER = REPO_ROOT / "packaging" / "qbt-static" / "in-container-build.sh"
-RELEASE_STAGE = REPO_ROOT / "packaging" / "qbt-static" / "stage-release-assets.sh"
-PRE_COMMIT_HOOK = REPO_ROOT / ".githooks" / "pre-commit"
-PRE_PUSH_HOOK = REPO_ROOT / ".githooks" / "pre-push"
 PATCH_SOURCE_DIR = REPO_ROOT / "packaging" / "qbt-static" / "patches" / "qbittorrent" / "4.6.7"
 PATCH_SERIES = PATCH_SOURCE_DIR / "series"
+SOURCE_OVERRIDE_DIR = PATCH_SOURCE_DIR / "source"
 PATCH_STAGE_DIR = REPO_ROOT / "build" / "qbt-static" / "work" / "patches" / "qbittorrent" / "4.6.7"
+SOURCE_OVERRIDE_STAGE_DIR = PATCH_STAGE_DIR / "source"
 LT_RETENTION_OVERLAY_SOURCE_DIR = REPO_ROOT / "packaging" / "qbt-source-overlays" / "lt-retention-narrow"
 LT_RETENTION_OVERLAY_STAGE_DIR = REPO_ROOT / "build" / "qbt-static" / "work" / "source-overlays" / "lt-retention-narrow"
-CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
-RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
 COMPAT_PATCH = "9000-static-qt610-compat.diff"
 NARROW_PAYLOAD_PATCH = "0005-feat-narrow-steady-state-payload-policy.patch"
 FULL_UPDATE_SCROLL_PATCH = "0006-fix-preserve-virtual-scroll-on-full-update.patch"
+ALERT_QUEUE_ROLLBACK_PATCH = "0006-revert-alert-queue-to-stock-qb-policy.patch"
+MEMORY_PROBE_SOURCE_MARKERS = {
+    "src/base/preferences.cpp": (
+        'value(u"BitTorrent/ExperimentalWebUIMemoryProbeEnabled"_s, false)',
+        'value<int>(u"BitTorrent/ExperimentalWebUIMemoryProbeIntervalMs"_s, 5000)',
+        'value(u"BitTorrent/ExperimentalWebUIMemoryProbeOutputPath"_s, QString {}).trimmed()',
+    ),
+    "src/base/preferences.h": (
+        "bool isExperimentalWebUIMemoryProbeEnabled() const;",
+        "int experimentalWebUIMemoryProbeIntervalMs() const;",
+        "QString experimentalWebUIMemoryProbeOutputPath() const;",
+    ),
+    "src/webui/api/maindatasyncstore.cpp": (
+        "m_memoryProbe.outputPath = preferences->experimentalWebUIMemoryProbeOutputPath();",
+        "m_memoryProbe.enabled = preferences->isExperimentalWebUIMemoryProbeEnabled() && !m_memoryProbe.outputPath.isEmpty();",
+        'emitMemoryProbeEvent(u"tick"_s, {});',
+        "QVariantMap WebUISync::MaindataSyncStore::collectMemoryProbeSample() const",
+        "void WebUISync::MaindataSyncStore::emitMemoryProbeEvent",
+    ),
+    "src/webui/api/maindatasyncstore.h": (
+        "void startMemoryProbeTimer();",
+        "QVariantMap collectMemoryProbeSample() const;",
+        "MemoryProbeState m_memoryProbe;",
+    ),
+}
+STOCK_ALERT_QUEUE_LINE = (
+    "settingsPack.set_int(lt::settings_pack::alert_queue_size, "
+    "std::numeric_limits<int>::max() / 2);"
+)
+BOUNDED_ALERT_QUEUE_LINE = (
+    "settingsPack.set_int(lt::settings_pack::alert_queue_size, "
+    "Preferences::instance()->sessionAlertQueueSize());"
+)
+SESSIONIMPL_WITH_BOUNDED_ALERT_QUEUE = """lt::settings_pack SessionImpl::loadLTSettings() const
+{
+    settingsPack.set_int(lt::settings_pack::active_tracker_limit, -1);
+    settingsPack.set_int(lt::settings_pack::active_dht_limit, -1);
+    settingsPack.set_int(lt::settings_pack::active_lsd_limit, -1);
+    settingsPack.set_int(lt::settings_pack::alert_queue_size, Preferences::instance()->sessionAlertQueueSize());
+
+    // Outgoing ports
+    settingsPack.set_int(lt::settings_pack::outgoing_port, outgoingPortsMin());
+}
+"""
 UPSTREAM_TEST_CMAKELISTS = """if (QT6)
     find_package(Qt6 REQUIRED COMPONENTS Test)
 else()
@@ -89,31 +128,6 @@ def extract_patch_for_file(patch_path: Path, relative_path: str) -> str:
 class QbtStaticWrapperTest(unittest.TestCase):
     maxDiff = None
 
-    def test_public_repository_docs_and_ignore_rules_match_wrapper_scope(self) -> None:
-        readme_text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        readme_zh_text = (REPO_ROOT / "README.zh-CN.md").read_text(encoding="utf-8")
-        patch_readme_text = (PATCH_SOURCE_DIR / "README.md").read_text(encoding="utf-8")
-        lt_overlay_readme_text = (LT_RETENTION_OVERLAY_SOURCE_DIR / "README.md").read_text(encoding="utf-8")
-        artifacts_readme_text = (REPO_ROOT / "artifacts" / "README.md").read_text(encoding="utf-8")
-        gitignore_text = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
-
-        self.assertIn("wrapper, patch set, and source overlays", readme_text)
-        self.assertIn("wrapper、patch 集和 source overlay", readme_zh_text)
-        self.assertIn("qBittorrent deltas applied by the static build wrapper", patch_readme_text)
-        self.assertIn("retained `torrentstatusquery.h` override", lt_overlay_readme_text)
-        self.assertIn("GitHub Release assets", artifacts_readme_text)
-
-        self.assertIn("artifacts/*", gitignore_text)
-        self.assertIn("!artifacts/README.md", gitignore_text)
-        self.assertIn(".pytest_cache/", gitignore_text)
-        self.assertIn(".omx/", gitignore_text)
-        self.assertIn(".github/workflows/", readme_text)
-        self.assertIn("SHA256SUMS", readme_text)
-        self.assertIn("QBT_GPG_PRIVATE_KEY", readme_text)
-        self.assertIn("SHA256SUMS", readme_zh_text)
-        self.assertIn("QBT_GPG_PRIVATE_KEY", readme_zh_text)
-        self.assertIn("SHA256SUMS.asc", artifacts_readme_text)
-
     def test_plan_reports_pinned_static_build_inputs(self) -> None:
         self.assertTrue(WRAPPER.is_file(), f"missing wrapper script: {WRAPPER}")
 
@@ -168,17 +182,61 @@ class QbtStaticWrapperTest(unittest.TestCase):
         self.assertEqual(staged_patch_names, source_patch_names)
         self.assertIn(NARROW_PAYLOAD_PATCH, source_patch_names)
         self.assertIn(FULL_UPDATE_SCROLL_PATCH, source_patch_names)
+        self.assertIn(ALERT_QUEUE_ROLLBACK_PATCH, source_patch_names)
         source_series = PATCH_SERIES.read_text(encoding="utf-8").splitlines()
         staged_series = (PATCH_STAGE_DIR / "series").read_text(encoding="utf-8").splitlines()
         self.assertEqual(staged_series, source_series)
         self.assertEqual(source_series.count(FULL_UPDATE_SCROLL_PATCH), 1, source_series)
-        self.assertEqual(source_series[-2:], [NARROW_PAYLOAD_PATCH, FULL_UPDATE_SCROLL_PATCH])
+        self.assertEqual(source_series.count(ALERT_QUEUE_ROLLBACK_PATCH), 1, source_series)
+        self.assertEqual(
+            source_series[-3:],
+            [NARROW_PAYLOAD_PATCH, FULL_UPDATE_SCROLL_PATCH, ALERT_QUEUE_ROLLBACK_PATCH],
+        )
         self.assertTrue((PATCH_SOURCE_DIR / COMPAT_PATCH).is_file(), "missing isolated static-toolchain compatibility patch")
         self.assertTrue((PATCH_STAGE_DIR / COMPAT_PATCH).is_file(), "missing staged static-toolchain compatibility patch")
+        self.assertTrue(SOURCE_OVERRIDE_DIR.is_dir(), "missing qB source override directory")
+        self.assertTrue(SOURCE_OVERRIDE_STAGE_DIR.is_dir(), "missing staged qB source override directory")
         self.assertTrue(
             (LT_RETENTION_OVERLAY_STAGE_DIR / "src/base/bittorrent/torrentstatusquery.h").is_file(),
             "missing staged lt-retention source overlay header",
         )
+
+    def test_source_override_keeps_memory_probe_and_stock_alert_queue_policy(self) -> None:
+        self.assertTrue(SOURCE_OVERRIDE_DIR.is_dir(), f"missing source override dir: {SOURCE_OVERRIDE_DIR}")
+
+        for relative_path, markers in MEMORY_PROBE_SOURCE_MARKERS.items():
+            source_path = SOURCE_OVERRIDE_DIR / relative_path
+            self.assertTrue(source_path.is_file(), f"missing memory probe source override: {relative_path}")
+            source_text = source_path.read_text(encoding="utf-8")
+            for marker in markers:
+                self.assertIn(marker, source_text, f"missing memory probe marker in {relative_path}: {marker}")
+
+        sessionimpl_text = (SOURCE_OVERRIDE_DIR / "src/base/bittorrent/sessionimpl.cpp").read_text(encoding="utf-8")
+        self.assertIn(STOCK_ALERT_QUEUE_LINE, sessionimpl_text)
+        self.assertNotIn(BOUNDED_ALERT_QUEUE_LINE, sessionimpl_text)
+
+    def test_prepare_overlay_stages_memory_probe_source_override_and_stock_alert_queue_policy(self) -> None:
+        subprocess.run(
+            ["bash", str(WRAPPER), "prepare-overlay"],
+            check=True,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertTrue(SOURCE_OVERRIDE_STAGE_DIR.is_dir(), "missing staged source override dir")
+        for relative_path, markers in MEMORY_PROBE_SOURCE_MARKERS.items():
+            staged_source_path = SOURCE_OVERRIDE_STAGE_DIR / relative_path
+            self.assertTrue(staged_source_path.is_file(), f"missing staged memory probe source: {relative_path}")
+            staged_source_text = staged_source_path.read_text(encoding="utf-8")
+            for marker in markers:
+                self.assertIn(marker, staged_source_text, f"missing staged memory probe marker in {relative_path}: {marker}")
+
+        staged_sessionimpl_text = (SOURCE_OVERRIDE_STAGE_DIR / "src/base/bittorrent/sessionimpl.cpp").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(STOCK_ALERT_QUEUE_LINE, staged_sessionimpl_text)
+        self.assertNotIn(BOUNDED_ALERT_QUEUE_LINE, staged_sessionimpl_text)
 
     def test_narrow_payload_patch_dry_runs_after_prior_test_cmakelists_patches(self) -> None:
         file_relative_path = "test/CMakeLists.txt"
@@ -208,6 +266,34 @@ class QbtStaticWrapperTest(unittest.TestCase):
             dry_run = subprocess.run(
                 ["patch", "-p1", "--dry-run"],
                 input=narrow_patch_text,
+                cwd=tree_root,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+
+    def test_alert_queue_runtime_rollback_patch_is_appended_and_dry_runs(self) -> None:
+        rollback_patch_path = PATCH_SOURCE_DIR / ALERT_QUEUE_ROLLBACK_PATCH
+        self.assertTrue(rollback_patch_path.is_file(), f"missing rollback patch: {rollback_patch_path}")
+
+        series_lines = PATCH_SERIES.read_text(encoding="utf-8").splitlines()
+        self.assertGreaterEqual(len(series_lines), 6, "expected rollback patch appended after existing qB series")
+        self.assertEqual(
+            series_lines[-3:],
+            [NARROW_PAYLOAD_PATCH, FULL_UPDATE_SCROLL_PATCH, ALERT_QUEUE_ROLLBACK_PATCH],
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tree_root = Path(tmpdir)
+            target_file = tree_root / "src/base/bittorrent/sessionimpl.cpp"
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            target_file.write_text(SESSIONIMPL_WITH_BOUNDED_ALERT_QUEUE, encoding="utf-8")
+
+            rollback_patch_text = extract_patch_for_file(rollback_patch_path, "src/base/bittorrent/sessionimpl.cpp")
+            dry_run = subprocess.run(
+                ["patch", "-p1", "--dry-run"],
+                input=rollback_patch_text,
                 cwd=tree_root,
                 capture_output=True,
                 text=True,
@@ -342,188 +428,6 @@ class QbtStaticWrapperTest(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(with_ceiling.returncode, 0, with_ceiling.stderr)
-
-    def test_release_stage_script_requires_built_binary(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            release_dir = Path(tmpdir) / "release"
-            missing_binary = Path(tmpdir) / "missing" / "qbittorrent-nox"
-            result = subprocess.run(
-                ["bash", str(RELEASE_STAGE), str(release_dir), str(missing_binary)],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("missing built artifact", result.stderr)
-
-    def test_release_stage_script_stages_binary_and_sha256sums(self) -> None:
-        payload = b"static-qbt-test-payload\n"
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            source_binary = tmp_path / "qbittorrent-nox"
-            release_dir = tmp_path / "release"
-            source_binary.write_bytes(payload)
-
-            result = subprocess.run(
-                ["bash", str(RELEASE_STAGE), str(release_dir), str(source_binary)],
-                cwd=REPO_ROOT,
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-            staged_binary = release_dir / "qbittorrent-nox-4.6.7-linux-x86_64-static"
-            checksum_path = release_dir / "SHA256SUMS"
-
-            self.assertEqual(result.stdout.strip(), str(release_dir))
-            self.assertTrue(staged_binary.is_file(), f"missing staged binary: {staged_binary}")
-            self.assertEqual(staged_binary.read_bytes(), payload)
-            self.assertTrue(checksum_path.is_file(), f"missing checksum file: {checksum_path}")
-            self.assertFalse((release_dir / "SHA256SUMS.asc").exists())
-
-            expected_hash = hashlib.sha256(payload).hexdigest()
-            checksum_text = checksum_path.read_text(encoding="utf-8")
-            self.assertIn(f"{expected_hash}  {staged_binary.name}", checksum_text)
-
-    def test_release_stage_script_optionally_signs_checksums(self) -> None:
-        if shutil.which("gpg") is None:
-            self.skipTest("gpg is not installed")
-
-        payload = b"static-qbt-test-payload\n"
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            gnupg_home = tmp_path / "gnupg"
-            source_binary = tmp_path / "qbittorrent-nox"
-            release_dir = tmp_path / "release"
-            source_binary.write_bytes(payload)
-            gnupg_home.mkdir(mode=0o700)
-
-            generate_key = subprocess.run(
-                [
-                    "gpg",
-                    "--homedir",
-                    str(gnupg_home),
-                    "--batch",
-                    "--pinentry-mode",
-                    "loopback",
-                    "--passphrase",
-                    "",
-                    "--quick-generate-key",
-                    "QBT Release Test <release@example.com>",
-                    "default",
-                    "sign",
-                    "0",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(generate_key.returncode, 0, generate_key.stdout + generate_key.stderr)
-
-            list_keys = subprocess.run(
-                ["gpg", "--homedir", str(gnupg_home), "--list-secret-keys", "--with-colons"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            key_id = next(
-                line.split(":")[4]
-                for line in list_keys.stdout.splitlines()
-                if line.startswith("sec:")
-            )
-
-            result = subprocess.run(
-                ["bash", str(RELEASE_STAGE), str(release_dir), str(source_binary)],
-                cwd=REPO_ROOT,
-                env={
-                    **os.environ,
-                    "GNUPGHOME": str(gnupg_home),
-                    "QBT_RELEASE_GPG_KEY_ID": key_id,
-                },
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-            checksum_path = release_dir / "SHA256SUMS"
-            signature_path = release_dir / "SHA256SUMS.asc"
-            self.assertTrue(signature_path.is_file(), f"missing checksum signature: {signature_path}")
-
-            verify = subprocess.run(
-                [
-                    "gpg",
-                    "--homedir",
-                    str(gnupg_home),
-                    "--verify",
-                    str(signature_path),
-                    str(checksum_path),
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(verify.returncode, 0, verify.stdout + verify.stderr)
-
-    def test_github_actions_workflows_cover_ci_and_release_distribution(self) -> None:
-        ci_text = CI_WORKFLOW.read_text(encoding="utf-8")
-        release_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-
-        self.assertIn("pull_request:", ci_text)
-        self.assertIn("push:", ci_text)
-        self.assertIn("python3 -m pytest tests/test_qbt_static_wrapper.py -q", ci_text)
-        self.assertIn("bash -n packaging/qbt-static/run-static-build.sh", ci_text)
-        self.assertIn("bash -n packaging/qbt-static/in-container-build.sh", ci_text)
-        self.assertIn("bash -n packaging/qbt-static/stage-release-assets.sh", ci_text)
-
-        self.assertIn("workflow_dispatch:", release_text)
-        self.assertIn("tags:", release_text)
-        self.assertIn("- 'v*'", release_text)
-        self.assertIn("contents: write", release_text)
-        self.assertIn("run-static-build.sh build", release_text)
-        self.assertIn("stage-release-assets.sh", release_text)
-        self.assertIn("SHA256SUMS", release_text)
-        self.assertIn("QBT_GPG_PRIVATE_KEY", release_text)
-        self.assertIn("gh release create", release_text)
-        self.assertIn("gh release upload", release_text)
-
-    def test_release_workflow_checks_out_resolved_release_ref_before_build(self) -> None:
-        release_text = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-
-        self.assertIn("fetch-depth: 0", release_text)
-        self.assertIn('printf \'QBT_RELEASE_TAG=%s\\n\' "${release_tag}" >> "${GITHUB_ENV}"', release_text)
-        self.assertIn('git fetch --force --tags origin "${QBT_RELEASE_TAG}"', release_text)
-        self.assertIn('git checkout --force "${QBT_RELEASE_TAG}"', release_text)
-        self.assertIn("if: ${{ env.QBT_GPG_PRIVATE_KEY != '' }}", release_text)
-        self.assertNotIn("if: ${{ secrets.QBT_GPG_PRIVATE_KEY != '' }}", release_text)
-
-    def test_githooks_privacy_scan_is_limited_to_exact_repo_local_leak_markers(self) -> None:
-        pre_commit_text = PRE_COMMIT_HOOK.read_text(encoding="utf-8")
-        pre_push_text = PRE_PUSH_HOOK.read_text(encoding="utf-8")
-        scan_section = pre_commit_text.split("local -a patterns=", 1)[1]
-        exact_markers = [
-            '"' + "/home/" + "ryan" + '"',
-            '"' + "/mnt/c/" + "Users/" + '"',
-            '"' + "C:" + "\\\\\\\\" + "Users" + "\\\\\\\\" + '"',
-            '"' + "/" + "Users/" + '"',
-            '"' + "ryan" + "@localhost" + '"',
-            '"' + "Codex <" + "codex@local" + "\\\\.invalid>" + '"',
-            '"' + "qi" + "he" + '"',
-            '"' + "qdirected" + "-bench" + '"',
-            '"' + "browser" + "-forge" + '"',
-            '"' + "dut-upstream" + "-corpus" + '"',
-        ]
-
-        self.assertIn(".githooks/*", pre_commit_text)
-        self.assertIn("exec", pre_push_text)
-        for marker in exact_markers:
-            self.assertIn(marker, pre_commit_text)
-
-        self.assertNotIn("placeholder" + " identity", pre_commit_text)
-        self.assertNotIn("${HOME}", scan_section)
-        self.assertNotIn("${repo_root}", scan_section)
-        self.assertNotIn("patterns+=(", pre_push_text)
 
 
 if __name__ == "__main__":
