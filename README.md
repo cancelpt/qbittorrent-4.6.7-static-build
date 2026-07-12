@@ -47,7 +47,7 @@ bash packaging/qbt-static/run-static-build.sh shell
 ## Build baseline
 
 - qBittorrent tag: `release-4.6.7`
-- public release version: `v4.6.7-lt1.2.20-r1`
+- public release version: `v4.6.7-lt1.2.20-r2`
 - preferred libtorrent: `1.2.20`
 - fallback libtorrent: `1.2.19`
 - Qt line: `6`
@@ -88,11 +88,11 @@ Repository automation lives under `.github/workflows/`:
 - `ci.yml`
   runs shell syntax checks plus `python3 -m pytest tests/test_qbt_static_wrapper.py -q` on every push and pull request
 - `release.yml`
-  triggers on `v*` tags or manual `workflow_dispatch`, uses canonical public tags such as `v4.6.7-lt1.2.20-r1`, runs `packaging/qbt-static/run-static-build.sh build`, stages release assets with `packaging/qbt-static/stage-release-assets.sh`, and publishes GitHub Release assets instead of committing binaries to git
+  triggers on `v*` tags or manual `workflow_dispatch`, uses canonical public tags such as `v4.6.7-lt1.2.20-r2`, runs `packaging/qbt-static/run-static-build.sh build`, stages release assets with `packaging/qbt-static/stage-release-assets.sh`, and publishes GitHub Release assets instead of committing binaries to git
 
 Release bundles contain:
 
-- `qbittorrent-nox-v4.6.7-lt1.2.20-r1-linux-x86_64-static`
+- `qbittorrent-nox-v4.6.7-lt1.2.20-r2-linux-x86_64-static`
 - `SHA256SUMS`
 - `SHA256SUMS.asc` when signing is enabled
 

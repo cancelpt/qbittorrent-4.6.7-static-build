@@ -705,6 +705,71 @@ window.qBittorrent.DynamicTable = (function() {
                 this.virtualRefreshFrameId = setTimeout(refresh, 0);
         },
 
+        captureViewportState: function() {
+            const tableDiv = $(this.dynamicTableDivId);
+            if (!tableDiv)
+                return null;
+
+            return {
+                scrollTop: tableDiv.scrollTop || 0,
+                clientHeight: tableDiv.clientHeight || 0,
+                scrollHeight: tableDiv.scrollHeight || 0
+            };
+        },
+
+        restoreViewportState: function(viewportState) {
+            const tableDiv = $(this.dynamicTableDivId);
+            if (!viewportState || !tableDiv)
+                return null;
+
+            const cancelPendingRefresh = function() {
+                if (this.virtualRefreshFrameId === null)
+                    return;
+
+                if (typeof window.cancelAnimationFrame === 'function')
+                    window.cancelAnimationFrame(this.virtualRefreshFrameId);
+                clearTimeout(this.virtualRefreshFrameId);
+                this.virtualRefreshFrameId = null;
+            }.bind(this);
+
+            cancelPendingRefresh();
+
+            const savedScrollTop = Number.parseInt(viewportState.scrollTop, 10);
+            const maxScrollTop = Math.max(0, (tableDiv.scrollHeight || 0) - (tableDiv.clientHeight || 0));
+            const clampedScrollTop = Math.min(Math.max(Number.isFinite(savedScrollTop) ? savedScrollTop : 0, 0), maxScrollTop);
+
+            tableDiv.scrollTop = clampedScrollTop;
+            cancelPendingRefresh();
+            this.refreshVirtualTableWindow(false);
+
+            return {
+                scrollTop: tableDiv.scrollTop || 0,
+                clientHeight: tableDiv.clientHeight || 0,
+                scrollHeight: tableDiv.scrollHeight || 0,
+                maxScrollTop: maxScrollTop
+            };
+        },
+
+        filterExistingRowIds: function(rowIds) {
+            const filteredRowIds = [];
+            if (!rowIds)
+                return filteredRowIds;
+
+            const rowIndexById = this.rowOrderState ? this.rowOrderState.rowIndexById : null;
+            for (let i = 0; i < rowIds.length; ++i) {
+                const rowId = `${rowIds[i]}`;
+                if (rowIndexById) {
+                    if (rowIndexById[rowId] !== undefined)
+                        filteredRowIds.push(rowId);
+                }
+                else if (this.rows && this.rows.has(rowId)) {
+                    filteredRowIds.push(rowId);
+                }
+            }
+
+            return filteredRowIds;
+        },
+
         assignRowIdentity: function(tr, rowId) {
             tr.setProperty("data-row-id", rowId);
             tr['rowId'] = rowId;
