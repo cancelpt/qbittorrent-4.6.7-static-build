@@ -24,7 +24,7 @@ COMPAT_PATCH = "9000-static-qt610-compat.diff"
 NARROW_PAYLOAD_PATCH = "0005-feat-narrow-steady-state-payload-policy.patch"
 FULL_UPDATE_SCROLL_PATCH = "0006-fix-preserve-virtual-scroll-on-full-update.patch"
 ALERT_QUEUE_ROLLBACK_PATCH = "0006-revert-alert-queue-to-stock-qb-policy.patch"
-PUBLIC_RELEASE_VERSION = "v4.6.7-lt1.2.20-r1"
+PUBLIC_RELEASE_VERSION = "v4.6.7-lt1.2.20-r2"
 PUBLIC_RELEASE_ASSET_NAME = f"qbittorrent-nox-{PUBLIC_RELEASE_VERSION}-linux-x86_64-static"
 LEGACY_RELEASE_ASSET_NAME = "qbittorrent-nox-4.6.7-linux-x86_64-static"
 MEMORY_PROBE_SOURCE_MARKERS = {
@@ -49,6 +49,18 @@ MEMORY_PROBE_SOURCE_MARKERS = {
         "void startMemoryProbeTimer();",
         "QVariantMap collectMemoryProbeSample() const;",
         "MemoryProbeState m_memoryProbe;",
+    ),
+}
+SCROLLFIX_WEBUI_MARKERS = {
+    "src/webui/www/private/scripts/client.js": (
+        "captureViewportState",
+        "restoreViewportState",
+        "filterExistingRowIds",
+    ),
+    "src/webui/www/private/scripts/dynamicTable.js": (
+        "captureViewportState",
+        "restoreViewportState",
+        "filterExistingRowIds",
     ),
 }
 STOCK_ALERT_QUEUE_LINE = (
@@ -242,6 +254,33 @@ class QbtStaticWrapperTest(unittest.TestCase):
         )
         self.assertIn(STOCK_ALERT_QUEUE_LINE, staged_sessionimpl_text)
         self.assertNotIn(BOUNDED_ALERT_QUEUE_LINE, staged_sessionimpl_text)
+
+    def test_source_override_keeps_scrollfix_markers_in_webui_scripts(self) -> None:
+        self.assertTrue(SOURCE_OVERRIDE_DIR.is_dir(), f"missing source override dir: {SOURCE_OVERRIDE_DIR}")
+
+        for relative_path, markers in SCROLLFIX_WEBUI_MARKERS.items():
+            source_path = SOURCE_OVERRIDE_DIR / relative_path
+            self.assertTrue(source_path.is_file(), f"missing scrollfix source override: {relative_path}")
+            source_text = source_path.read_text(encoding="utf-8")
+            for marker in markers:
+                self.assertIn(marker, source_text, f"missing scrollfix marker in {relative_path}: {marker}")
+
+    def test_prepare_overlay_stages_scrollfix_markers_in_webui_scripts(self) -> None:
+        subprocess.run(
+            ["bash", str(WRAPPER), "prepare-overlay"],
+            check=True,
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertTrue(SOURCE_OVERRIDE_STAGE_DIR.is_dir(), "missing staged source override dir")
+        for relative_path, markers in SCROLLFIX_WEBUI_MARKERS.items():
+            staged_source_path = SOURCE_OVERRIDE_STAGE_DIR / relative_path
+            self.assertTrue(staged_source_path.is_file(), f"missing staged scrollfix source: {relative_path}")
+            staged_source_text = staged_source_path.read_text(encoding="utf-8")
+            for marker in markers:
+                self.assertIn(marker, staged_source_text, f"missing staged scrollfix marker in {relative_path}: {marker}")
 
     def test_stage_release_assets_uses_canonical_public_release_version_filename(self) -> None:
         self.assertTrue(STAGE_RELEASE_ASSETS.is_file(), f"missing stage release script: {STAGE_RELEASE_ASSETS}")
