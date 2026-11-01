@@ -65,8 +65,8 @@ jobs:
       - name: Check out resolved release ref
         run: |
           git check-ref-format "refs/tags/${QBT_RELEASE_TAG}"
-          git fetch --no-tags origin "refs/tags/${QBT_RELEASE_TAG}:refs/tags/${QBT_RELEASE_TAG}"
-          release_commit="$(git rev-parse --verify "refs/tags/${QBT_RELEASE_TAG}^{commit}")"
+          git fetch --no-tags origin "refs/tags/${QBT_RELEASE_TAG}"
+          release_commit="$(git rev-parse --verify 'FETCH_HEAD^{commit}')"
           git checkout --detach "${release_commit}"
           [[ "$(git rev-parse HEAD)" == "${release_commit}" ]]
           printf 'QBT_RELEASE_COMMIT=%s\n' "${release_commit}" >> "${GITHUB_ENV}"
