@@ -2490,6 +2490,7 @@ WebUISync::MaindataSyncStore::MaindataSyncStore(QObject *parent)
         connect(session, &BitTorrent::Session::torrentTagAdded, this, &MaindataSyncStore::onTorrentTagAdded);
         connect(session, &BitTorrent::Session::torrentTagRemoved, this, &MaindataSyncStore::onTorrentTagRemoved);
         connect(session, &BitTorrent::Session::torrentsUpdated, this, &MaindataSyncStore::onTorrentsUpdated);
+        connect(session, &BitTorrent::Session::trackerEntriesUpdated, this, &MaindataSyncStore::onTorrentTrackerEntriesUpdated);
         connect(session, &BitTorrent::Session::trackersChanged, this, &MaindataSyncStore::onTorrentTrackersChanged);
 
         if (session->isRestored())
@@ -3940,6 +3941,14 @@ void WebUISync::MaindataSyncStore::onTorrentsUpdated(const QVector<BitTorrent::T
         m_updatedTorrents.insert(torrent->id());
 }
 
+void WebUISync::MaindataSyncStore::onTorrentTrackerEntriesUpdated(BitTorrent::Torrent *torrent)
+{
+    if (!shouldTrackDirtyState())
+        return;
+
+    m_updatedTorrents.insert(torrent->id());
+}
+
 void WebUISync::MaindataSyncStore::onTorrentTrackersChanged(BitTorrent::Torrent *torrent)
 {
     if (!shouldTrackDirtyState())
@@ -3954,6 +3963,7 @@ void WebUISync::MaindataSyncStore::onTorrentTrackersChanged(BitTorrent::Torrent 
         currentTrackers.insert(currentTrackerEntry.url);
 
     const TorrentID torrentID = torrent->id();
+    m_updatedTorrents.insert(torrentID);
     Algorithm::removeIf(m_knownTrackers
             , [this, torrentID, currentTrackers]
                     (const QString &knownTracker, QSet<TorrentID> &torrentIDs)

@@ -3,10 +3,12 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -143,6 +145,16 @@ def extract_patch_for_file(patch_path: Path, relative_path: str) -> str:
 
 class QbtStaticWrapperTest(unittest.TestCase):
     maxDiff = None
+
+    def setUp(self) -> None:
+        # Nested fixture repositories must not inherit the caller's active index.
+        git_context = {"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR",
+                       "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                       "GIT_PREFIX", "GIT_CEILING_DIRECTORIES"}
+        environment = patch.dict(os.environ, {key: value for key, value in os.environ.items()
+                                              if key not in git_context}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def test_plan_reports_pinned_static_build_inputs(self) -> None:
         self.assertTrue(WRAPPER.is_file(), f"missing wrapper script: {WRAPPER}")
@@ -566,13 +578,173 @@ class QbtStaticWrapperTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             for value in fixtures:
                 fixture.write_text(value + "\n", encoding="utf-8")
+                subprocess.run(["git", "add", "--", "fixture.txt"], cwd=root, check=True)
                 result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("value redacted", result.stdout)
                 self.assertNotIn(value, result.stdout + result.stderr)
             fixture.write_text(synthetic_root + "/example\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "fixture.txt"], cwd=root, check=True)
             result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0, "the upstream example exemption is path-specific")
+
+    def test_privacy_scan_checks_index_even_when_worktree_is_clean_or_missing(self) -> None:
+        hook = (REPO_ROOT / ".githooks/pre-commit").read_text(encoding="utf-8")
+        scanner = hook.split("    python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            fixture = root / "fixture.txt"
+            marker = "ghp_" + "x" * 40
+            fixture.write_text(marker + "\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "fixture.txt"], cwd=root, check=True)
+            for missing in [False, True]:
+                with self.subTest(missing_worktree_file=missing):
+                    if missing:
+                        fixture.unlink()
+                    else:
+                        fixture.write_text("Clean unstaged text\n", encoding="utf-8")
+                    result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0, "sensitive indexed bytes must be rejected")
+                    self.assertIn("value redacted", result.stdout)
+                    self.assertNotIn(marker, result.stdout + result.stderr)
+
+            fixture.write_text("Clean staged text\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "fixture.txt"], cwd=root, check=True)
+            fixture.write_text(marker + "\n", encoding="utf-8")
+            result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, "unstaged bytes are not the commit payload")
+
+            fixture.write_text("Clean staged text\n", encoding="utf-8")
+            subprocess.run(["git", "rm", "--cached", "--", "fixture.txt"], cwd=root, check=True,
+                           capture_output=True)
+            result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, "a staged deletion contains no indexed payload")
+
+            subprocess.run(["git", "add", "--", "fixture.txt"], cwd=root, check=True)
+            object_id = subprocess.check_output(["git", "rev-parse", ":fixture.txt"], cwd=root, text=True).strip()
+            (root / ".git" / "objects" / object_id[:2] / object_id[2:]).unlink()
+            result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, "unreadable indexed blobs must fail closed")
+            self.assertIn("indexed blob unreadable", result.stdout)
+
+    def test_release_checkout_requires_existing_tag_and_uses_its_commit(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        script = workflow.split("      - name: Check out resolved release ref\n", 1)[1]
+        script = script.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "origin"
+            subprocess.run(["git", "init", "-q", str(source)], check=True)
+
+            def git(*args):
+                return subprocess.check_output(["git", *args], cwd=source, text=True).strip()
+
+            git("config", "user.name", "Release Fixture")
+            git("config", "user.email", "fixture@example.invalid")
+            git("config", "core.hooksPath", "/dev/null")
+            (source / "payload").write_text("Tagged product\n", encoding="utf-8")
+            git("add", "--", "payload")
+            git("-c", "commit.gpgSign=false", "commit", "-q", "-m", "Fixture product")
+            tagged_commit = git("rev-parse", "HEAD")
+            git("tag", PUBLIC_RELEASE_VERSION)
+            annotated = PUBLIC_RELEASE_VERSION + "-annotated"
+            git("-c", "tag.gpgSign=false", "tag", "-a", annotated, "-m", "Fixture tag")
+            (source / "payload").write_text("Different branch product\n", encoding="utf-8")
+            git("add", "--", "payload")
+            git("-c", "commit.gpgSign=false", "commit", "-q", "-m", "Fixture branch")
+            git("branch", PUBLIC_RELEASE_VERSION)
+            branch_only = PUBLIC_RELEASE_VERSION + "-branch-only"
+            git("branch", branch_only)
+            for index, (ref, expected) in enumerate([
+                (PUBLIC_RELEASE_VERSION, tagged_commit), (annotated, tagged_commit),
+                (branch_only, None), (PUBLIC_RELEASE_VERSION + "-missing", None),
+            ]):
+                with self.subTest(release_ref=ref):
+                    checkout = root / ("checkout-" + str(index))
+                    subprocess.run(["git", "clone", "-q", "--no-tags", str(source), str(checkout)], check=True)
+                    env_file = root / ("env-" + str(index))
+                    result = subprocess.run(["bash", "-e", "-c", script], cwd=checkout,
+                        env={**os.environ, "QBT_RELEASE_TAG": ref, "GITHUB_ENV": str(env_file)},
+                        capture_output=True, text=True)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode, 0, "branches cannot substitute for missing tags")
+                        self.assertFalse(env_file.exists())
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        actual = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout, text=True).strip()
+                        self.assertEqual(actual, expected)
+                        self.assertIn("QBT_RELEASE_COMMIT=" + expected, env_file.read_text(encoding="utf-8"))
+                        detached = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=checkout,
+                                                  capture_output=True, text=True)
+                        self.assertNotEqual(detached.returncode, 0)
+
+    def test_release_tag_input_rejects_invalid_refs_before_writing_environment(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        script = workflow.split("      - name: Resolve release tag\n", 1)[1]
+        script = script.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for index, value in enumerate(["", "../invalid", "v invalid", "v-test\nUNRELATED=value"]):
+                with self.subTest(release_tag=value):
+                    env_file = Path(tmpdir) / str(index)
+                    result = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                        env={**os.environ, "GITHUB_REF_TYPE": "branch", "RELEASE_TAG_INPUT": value,
+                             "GITHUB_ENV": str(env_file)})
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(env_file.exists())
+
+    def test_tracker_status_event_invalidates_only_the_affected_cached_row(self) -> None:
+        store = (SOURCE_OVERRIDE_DIR / "src/webui/api/maindatasyncstore.cpp").read_text(encoding="utf-8")
+        self.assertTrue("connect(session, &BitTorrent::Session::trackerEntriesUpdated, this, "
+                        "&MaindataSyncStore::onTorrentTrackerEntriesUpdated);" in store,
+                        "status-only tracker events must invalidate the cached row")
+        function = re.search(r"void WebUISync::MaindataSyncStore::onTorrentTrackerEntriesUpdated\([^)]*\)\n"
+                             r"\{.*?\n\}", store, re.S)
+        if function is None:
+            self.fail("status-only signals need an independent dirty-row handler")
+        list_handler = store.split("void WebUISync::MaindataSyncStore::onTorrentTrackersChanged(", 1)[1]
+        self.assertIn("m_updatedTorrents.insert(torrentID);", list_handler)
+        compiler = shutil.which("g++")
+        if not compiler:
+            self.skipTest("g++ is required for the production-handler execution probe")
+        prelude = """
+#include <cassert>
+#include <set>
+namespace BitTorrent { struct Torrent { int key; int id() const { return key; } }; }
+namespace WebUISync {
+struct MaindataSyncStore {
+    bool active = true;
+    std::set<int> m_updatedTorrents;
+    bool shouldTrackDirtyState() const { return active; }
+    void onTorrentTrackerEntriesUpdated(BitTorrent::Torrent *torrent);
+};
+}
+"""
+        probe = """
+int main() {
+    WebUISync::MaindataSyncStore store;
+    BitTorrent::Torrent first {7}, second {11};
+    store.active = false;
+    store.onTorrentTrackerEntriesUpdated(&first);
+    assert(store.m_updatedTorrents.empty());
+    store.active = true;
+    store.onTorrentTrackerEntriesUpdated(&first);
+    assert(store.m_updatedTorrents == std::set<int> {7});
+    store.onTorrentTrackerEntriesUpdated(&first);
+    assert(store.m_updatedTorrents.size() == 1);
+    store.onTorrentTrackerEntriesUpdated(&second);
+    assert(store.m_updatedTorrents == (std::set<int> {7, 11}));
+}
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "tracker-event.cpp"
+            binary = Path(tmpdir) / "tracker-event"
+            source.write_text(prelude + function.group(0) + probe, encoding="utf-8")
+            subprocess.run([compiler, "-std=c++17", "-Wall", "-Wextra", str(source), "-o", str(binary)],
+                           check=True, capture_output=True, text=True)
+            subprocess.run([str(binary)], check=True)
 
     def test_tracker_summary_is_kept_in_compact_and_descriptive_paths(self) -> None:
         store = (SOURCE_OVERRIDE_DIR / "src/webui/api/maindatasyncstore.cpp").read_text(encoding="utf-8")

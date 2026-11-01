@@ -230,6 +230,7 @@ namespace WebUISync
         void onTorrentTagAdded(BitTorrent::Torrent *torrent, const QString &tag);
         void onTorrentTagRemoved(BitTorrent::Torrent *torrent, const QString &tag);
         void onTorrentsUpdated(const QVector<BitTorrent::Torrent *> &torrents);
+        void onTorrentTrackerEntriesUpdated(BitTorrent::Torrent *torrent);
         void onTorrentTrackersChanged(BitTorrent::Torrent *torrent);
 
     private:
