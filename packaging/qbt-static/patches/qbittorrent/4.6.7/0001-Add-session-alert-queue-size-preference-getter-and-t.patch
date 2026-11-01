@@ -1,5 +1,5 @@
 From 6d85fdaeed8b2ee4f3788f0aa3aa83fda44e2b7e Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Sun, 26 Apr 2026 04:52:00 +0800
 Subject: [PATCH 1/4] Add session alert queue size preference getter and tests
 

@@ -95,6 +95,39 @@ namespace
     }
 
     template <typename MapType>
+    void insertTrackerFields(MapType &serialized, const BitTorrent::Torrent &torrent)
+    {
+        const auto trackers = torrent.trackers();
+        insertField(serialized, KEY_TORRENT_TRACKERS_COUNT, trackers.size());
+        int trackerState = 0;
+        int failBits = 0;
+        bool anyWorking = false;
+        for (const auto &tracker : trackers)
+        {
+            switch (tracker.status)
+            {
+            case BitTorrent::TrackerEntry::Working:
+                anyWorking = true;
+                break;
+            case BitTorrent::TrackerEntry::TrackerError:
+                failBits |= 2;  // bit1: tracker error (tracker reachable, app-level failure)
+                break;
+            case BitTorrent::TrackerEntry::NotWorking:
+            case BitTorrent::TrackerEntry::Unreachable:
+                failBits |= 4;  // bit2: announce error (network-level failure)
+                break;
+            default:
+                break;
+            }
+            if ((tracker.status == BitTorrent::TrackerEntry::Working) && !tracker.message.isEmpty())
+                trackerState |= 1;  // bit0: warning
+        }
+        if (!anyWorking)
+            trackerState |= failBits;
+        insertField(serialized, KEY_TORRENT_TRACKER_STATE, trackerState);
+    }
+
+    template <typename MapType>
     MapType serializeImpl(const BitTorrent::Torrent &torrent)
     {
         const auto *preferences = Preferences::instance();
@@ -174,7 +207,7 @@ namespace
             insertField(serialized, KEY_TORRENT_ADDED_ON, torrent.addedTime().toSecsSinceEpoch());
             insertField(serialized, KEY_TORRENT_COMPLETION_ON, torrent.completedTime().toSecsSinceEpoch());
             insertField(serialized, KEY_TORRENT_TRACKER, torrent.currentTracker());
-            insertField(serialized, KEY_TORRENT_TRACKERS_COUNT, torrent.trackers().size());
+            insertTrackerFields(serialized, torrent);
             insertField(serialized, KEY_TORRENT_MAX_RATIO, torrent.maxRatio());
             insertField(serialized, KEY_TORRENT_MAX_SEEDING_TIME, torrent.maxSeedingTime());
             insertField(serialized, KEY_TORRENT_MAX_INACTIVE_SEEDING_TIME, torrent.maxInactiveSeedingTime());
@@ -246,7 +279,7 @@ QVariantMap serializeDescriptiveFields(const BitTorrent::Torrent &torrent)
     insertField(serialized, KEY_TORRENT_ADDED_ON, torrent.addedTime().toSecsSinceEpoch());
     insertField(serialized, KEY_TORRENT_COMPLETION_ON, torrent.completedTime().toSecsSinceEpoch());
     insertField(serialized, KEY_TORRENT_TRACKER, torrent.currentTracker());
-    insertField(serialized, KEY_TORRENT_TRACKERS_COUNT, torrent.trackers().size());
+    insertTrackerFields(serialized, torrent);
     insertField(serialized, KEY_TORRENT_MAX_RATIO, torrent.maxRatio());
     insertField(serialized, KEY_TORRENT_MAX_SEEDING_TIME, torrent.maxSeedingTime());
     insertField(serialized, KEY_TORRENT_MAX_INACTIVE_SEEDING_TIME, torrent.maxInactiveSeedingTime());

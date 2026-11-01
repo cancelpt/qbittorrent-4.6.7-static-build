@@ -1,5 +1,5 @@
 From ac37db5cf7f4609412eb35fb38d4ecf2d1deded0 Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Sun, 26 Apr 2026 05:06:47 +0800
 Subject: [PATCH 3/4] feat: bound libtorrent alert queue size
 

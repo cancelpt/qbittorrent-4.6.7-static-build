@@ -1793,12 +1793,14 @@ window.qBittorrent.DynamicTable = (function() {
                             return false;
                         break; // do nothing
                     default:
+                        if (!Object.prototype.hasOwnProperty.call(category_list, categoryHashInt))
+                            break;
                         if (!useSubcategories) {
                             if (categoryHashInt !== genHash(row['full_data'].category))
                                 return false;
                         }
                         else {
-                            const selectedCategoryName = category_list[categoryHash].name + "/";
+                            const selectedCategoryName = category_list[categoryHashInt].name + "/";
                             const torrentCategoryName = row['full_data'].category + "/";
                             if (!torrentCategoryName.startsWith(selectedCategoryName))
                                 return false;
@@ -1836,6 +1838,18 @@ window.qBittorrent.DynamicTable = (function() {
                     break; // do nothing
                 case TRACKERS_TRACKERLESS:
                     if (row['full_data'].trackers_count !== 0)
+                        return false;
+                    break;
+                case TRACKERS_ERROR:
+                    if ((row['full_data'].tracker_state & 2) === 0)
+                        return false;
+                    break;
+                case TRACKERS_ANNOUNCE_ERROR:
+                    if ((row['full_data'].tracker_state & 4) === 0)
+                        return false;
+                    break;
+                case TRACKERS_WARNING:
+                    if ((row['full_data'].tracker_state & 1) === 0)
                         return false;
                     break;
                 default: {
