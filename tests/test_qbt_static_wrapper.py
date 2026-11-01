@@ -657,13 +657,19 @@ class QbtStaticWrapperTest(unittest.TestCase):
             git("branch", PUBLIC_RELEASE_VERSION)
             branch_only = PUBLIC_RELEASE_VERSION + "-branch-only"
             git("branch", branch_only)
-            for index, (ref, expected) in enumerate([
-                (PUBLIC_RELEASE_VERSION, tagged_commit), (annotated, tagged_commit),
-                (branch_only, None), (PUBLIC_RELEASE_VERSION + "-missing", None),
+            for index, (ref, expected, seed_local_tag) in enumerate([
+                (PUBLIC_RELEASE_VERSION, tagged_commit, False), (annotated, tagged_commit, False),
+                (annotated, tagged_commit, True), (branch_only, None, False),
+                (branch_only, None, True), (PUBLIC_RELEASE_VERSION + "-missing", None, False),
             ]):
-                with self.subTest(release_ref=ref):
+                with self.subTest(release_ref=ref, existing_local_tag=seed_local_tag):
                     checkout = root / ("checkout-" + str(index))
                     subprocess.run(["git", "clone", "-q", "--no-tags", str(source), str(checkout)], check=True)
+                    local_tag_before = None
+                    if seed_local_tag:
+                        subprocess.run(["git", "tag", ref], cwd=checkout, check=True)
+                        local_tag_before = subprocess.check_output(
+                            ["git", "rev-parse", "refs/tags/" + ref], cwd=checkout, text=True).strip()
                     env_file = root / ("env-" + str(index))
                     result = subprocess.run(["bash", "-e", "-c", script], cwd=checkout,
                         env={**os.environ, "QBT_RELEASE_TAG": ref, "GITHUB_ENV": str(env_file)},
@@ -679,6 +685,10 @@ class QbtStaticWrapperTest(unittest.TestCase):
                         detached = subprocess.run(["git", "symbolic-ref", "-q", "HEAD"], cwd=checkout,
                                                   capture_output=True, text=True)
                         self.assertNotEqual(detached.returncode, 0)
+                    if seed_local_tag:
+                        local_tag_after = subprocess.check_output(
+                            ["git", "rev-parse", "refs/tags/" + ref], cwd=checkout, text=True).strip()
+                        self.assertEqual(local_tag_after, local_tag_before, "checkout must not replace local tags")
 
     def test_release_tag_input_rejects_invalid_refs_before_writing_environment(self) -> None:
         workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
