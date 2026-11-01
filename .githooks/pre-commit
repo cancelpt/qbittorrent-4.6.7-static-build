@@ -6,7 +6,7 @@ cd "${repo_root}"
 
 run_privacy_scan() {
     python3 - <<'PY'
-from pathlib import Path
+import os
 import re
 import subprocess
 
@@ -21,11 +21,23 @@ patterns = [
 upstream_examples = 'packaging/qbt-static/patches/qbittorrent/4.6.7/source/src/base/bittorrent/torrent.h'
 synthetic_root = '/'.join(('', 'home', 'user', 'torrents'))
 failed = False
-for name in subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'):
-    path = Path(name)
-    if not name or not path.is_file():
+for entry in subprocess.check_output(['git', 'ls-files', '--stage', '-z']).split(b'\0'):
+    if not entry:
         continue
-    payload = path.read_bytes()
+    metadata, raw_name = entry.split(b'\t', 1)
+    mode, object_id, stage = metadata.split()
+    name = os.fsdecode(raw_name)
+    if stage != b'0' or mode not in (b'100644', b'100755', b'120000'):
+        print(f'privacy scan failed: {name} (unsupported index entry)')
+        failed = True
+        continue
+    try:
+        payload = subprocess.check_output(['git', 'cat-file', 'blob', object_id.decode('ascii')],
+                                          stderr=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        print(f'privacy scan failed: {name} (indexed blob unreadable)')
+        failed = True
+        continue
     if b'\0' in payload:
         continue
     for number, line in enumerate(payload.decode('utf-8', errors='replace').splitlines(), 1):
