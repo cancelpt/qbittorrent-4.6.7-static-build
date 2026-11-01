@@ -34,7 +34,7 @@ Current defaults live in [config.env](config.env):
 - Upstream repo: `https://github.com/userdocs/qbittorrent-nox-static.git`
 - Upstream ref: `a67e830`
 - qB tag: `release-4.6.7`
-- Public release version: `v4.6.7-lt1.2.20-r2`
+- Public release version: `v4.6.7-lt1.2.20-r3`
 - Preferred libtorrent: `1.2.20`
 - Fallback libtorrent: `1.2.19`
 - Qt line: `6`
@@ -78,16 +78,16 @@ The wrapper keeps the upstream toolchain but constrains the parts that must stay
 - Disables Qt6 features that otherwise pull host dynamic dependencies into the qmake/toolchain path: `icu`, `glib`, `zstd`, `brotli`, `gssapi`, `system_proxies`, `sql_mysql`, and `sql_psql`.
 - Cleans stale Qt SQL plugin archives and CMake package files from the prefix before both `build` and `shell` runs so old `mysql` / `psql` artifacts cannot leak back into the final qB link step.
 - Stages the patch overlay into `build/qbt-static/work/patches/` and the `lt-retention-narrow` overlay into `build/qbt-static/work/source-overlays/lt-retention-narrow/` before invoking the upstream builder.
-- Stages release assets with the stable filename `qbittorrent-nox-v4.6.7-lt1.2.20-r2-linux-x86_64-static`, plus `SHA256SUMS`, and signs the checksum file when `QBT_RELEASE_GPG_KEY_ID` is configured.
+- Stages release assets with the stable filename `qbittorrent-nox-v4.6.7-lt1.2.20-r3-linux-x86_64-static`, plus `SHA256SUMS`, and signs the checksum file when `QBT_RELEASE_GPG_KEY_ID` is configured.
 
 ## CI and release automation
 
 The repository automation keeps release mechanics inside this wrapper repo:
 
 - `.github/workflows/ci.yml`
-  runs shell syntax checks and the repository pytest suite for every push and pull request
+  runs shell syntax checks, the repository pytest suite, and WebUI regression tests for every push and pull request
 - `.github/workflows/release.yml`
-  builds with `run-static-build.sh build`, optionally imports `QBT_GPG_PRIVATE_KEY` and `QBT_GPG_PASSPHRASE`, stages assets with `stage-release-assets.sh`, then publishes GitHub Release assets
+  builds with `run-static-build.sh build`, stages assets and optional signatures, then creates or updates a draft GitHub Release for verification before publication; published assets are never overwritten
 
 ## Verification
 

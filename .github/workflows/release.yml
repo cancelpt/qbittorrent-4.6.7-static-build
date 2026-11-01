@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Git tag to publish, for example v4.6.7-lt1.2.20-r2
+        description: Existing Git tag to build, for example v4.6.7-lt1.2.20-r3
         required: true
         type: string
 
@@ -32,6 +32,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
 
       - name: Install repository and release dependencies
         run: |
@@ -67,12 +72,14 @@ jobs:
           bash -n packaging/qbt-static/in-container-build.sh
           bash -n packaging/qbt-static/stage-release-assets.sh
           python3 -m pytest tests/test_qbt_static_wrapper.py -q
+          node --test tests/test_webui_filters.js
 
       - name: Load public release metadata
         run: |
           set -a
           source packaging/qbt-static/config.env
           set +a
+          [[ "${QBT_RELEASE_TAG}" == "${QBT_STATIC_PUBLIC_RELEASE_VERSION}" ]]
           printf 'QBT_STATIC_PUBLIC_RELEASE_VERSION=%s\n' "${QBT_STATIC_PUBLIC_RELEASE_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Build static artifact
@@ -103,14 +110,20 @@ jobs:
       - name: Stage release assets and SHA256SUMS
         run: bash packaging/qbt-static/stage-release-assets.sh "${RUNNER_TEMP}/release-assets"
 
-      - name: Publish GitHub Release assets
+      - name: Stage draft GitHub Release assets
         run: |
           release_dir="${RUNNER_TEMP}/release-assets"
 
           if gh release view "${QBT_RELEASE_TAG}" > /dev/null 2>&1; then
+            is_draft="$(gh release view "${QBT_RELEASE_TAG}" --json isDraft --jq '.isDraft')"
+            if [[ "${is_draft}" != "true" ]]; then
+              printf 'refusing to replace assets of a published release\n' >&2
+              exit 1
+            fi
             gh release upload "${QBT_RELEASE_TAG}" "${release_dir}"/* --clobber
           else
             gh release create "${QBT_RELEASE_TAG}" "${release_dir}"/* \
+              --draft \
               --title "qBittorrent static ${QBT_STATIC_PUBLIC_RELEASE_VERSION}" \
-              --notes "Static build wrapper release assets for ${QBT_STATIC_PUBLIC_RELEASE_VERSION}."
+              --notes-file "docs/releases/${QBT_RELEASE_TAG}.md"
           fi

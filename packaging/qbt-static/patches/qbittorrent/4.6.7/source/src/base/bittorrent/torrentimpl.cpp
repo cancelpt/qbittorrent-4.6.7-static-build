@@ -96,8 +96,11 @@ namespace
         int numUpdating = 0;
         int numWorking = 0;
         int numNotWorking = 0;
+        int numTrackerError = 0;
+        int numUnreachable = 0;
         QString firstTrackerMessage;
         QString firstErrorMessage;
+        QString firstWorkingMessage;
 #ifdef QBT_USES_LIBTORRENT2
         const auto numEndpoints = static_cast<qsizetype>(nativeEntry.endpoints.size()) * ((hashes.has_v1() && hashes.has_v2()) ? 2 : 1);
         for (const lt::announce_endpoint &endpoint : nativeEntry.endpoints)
@@ -121,8 +124,21 @@ namespace
                     }
                     else if (infoHash.fails > 0)
                     {
-                        trackerEndpoint.status = TrackerEntry::NotWorking;
-                        ++numNotWorking;
+                        if (infoHash.last_error == lt::errors::tracker_failure)
+                        {
+                            trackerEndpoint.status = TrackerEntry::TrackerError;
+                            ++numTrackerError;
+                        }
+                        else if (infoHash.last_error == lt::errors::announce_skipped)
+                        {
+                            trackerEndpoint.status = TrackerEntry::Unreachable;
+                            ++numUnreachable;
+                        }
+                        else
+                        {
+                            trackerEndpoint.status = TrackerEntry::NotWorking;
+                            ++numNotWorking;
+                        }
                     }
                     else if (nativeEntry.verified)
                     {
@@ -137,6 +153,9 @@ namespace
                     const QString trackerMessage = QString::fromStdString(infoHash.message);
                     const QString errorMessage = QString::fromLocal8Bit(infoHash.last_error.message().c_str());
                     trackerEndpoint.message = (!trackerMessage.isEmpty() ? trackerMessage : errorMessage);
+
+                    if ((trackerEndpoint.status == TrackerEntry::Working) && firstWorkingMessage.isEmpty())
+                        firstWorkingMessage = trackerMessage;
 
                     trackerEntry.stats[endpoint.local_endpoint][(protocolVersion == lt::protocol_version::V1) ? 1 : 2] = trackerEndpoint;
                     trackerEntry.numPeers = std::max(trackerEntry.numPeers, trackerEndpoint.numPeers);
@@ -168,8 +187,21 @@ namespace
             }
             else if (endpoint.fails > 0)
             {
-                trackerEndpoint.status = TrackerEntry::NotWorking;
-                ++numNotWorking;
+                if (endpoint.last_error == lt::errors::tracker_failure)
+                {
+                    trackerEndpoint.status = TrackerEntry::TrackerError;
+                    ++numTrackerError;
+                }
+                else if (endpoint.last_error == lt::errors::announce_skipped)
+                {
+                    trackerEndpoint.status = TrackerEntry::Unreachable;
+                    ++numUnreachable;
+                }
+                else
+                {
+                    trackerEndpoint.status = TrackerEntry::NotWorking;
+                    ++numNotWorking;
+                }
             }
             else if (nativeEntry.verified)
             {
@@ -184,6 +216,9 @@ namespace
             const QString trackerMessage = QString::fromStdString(endpoint.message);
             const QString errorMessage = QString::fromLocal8Bit(endpoint.last_error.message().c_str());
             trackerEndpoint.message = (!trackerMessage.isEmpty() ? trackerMessage : errorMessage);
+
+            if ((trackerEndpoint.status == TrackerEntry::Working) && firstWorkingMessage.isEmpty())
+                firstWorkingMessage = trackerMessage;
 
             trackerEntry.stats[endpoint.local_endpoint][1] = trackerEndpoint;
             trackerEntry.numPeers = std::max(trackerEntry.numPeers, trackerEndpoint.numPeers);
@@ -200,16 +235,26 @@ namespace
 
         if (numEndpoints > 0)
         {
-            if (numUpdating > 0)
+            if (numWorking > 0)
+            {
+                trackerEntry.status = TrackerEntry::Working;
+                trackerEntry.message = firstWorkingMessage;
+            }
+            else if (numUpdating > 0)
             {
                 trackerEntry.status = TrackerEntry::Updating;
             }
-            else if (numWorking > 0)
+            else if (numTrackerError > 0)
             {
-                trackerEntry.status = TrackerEntry::Working;
-                trackerEntry.message = firstTrackerMessage;
+                trackerEntry.status = TrackerEntry::TrackerError;
+                trackerEntry.message = (!firstTrackerMessage.isEmpty() ? firstTrackerMessage : firstErrorMessage);
             }
-            else if (numNotWorking == numEndpoints)
+            else if (numUnreachable == numEndpoints)
+            {
+                trackerEntry.status = TrackerEntry::Unreachable;
+                trackerEntry.message = (!firstTrackerMessage.isEmpty() ? firstTrackerMessage : firstErrorMessage);
+            }
+            else if ((numUnreachable + numNotWorking) == numEndpoints)
             {
                 trackerEntry.status = TrackerEntry::NotWorking;
                 trackerEntry.message = (!firstTrackerMessage.isEmpty() ? firstTrackerMessage : firstErrorMessage);

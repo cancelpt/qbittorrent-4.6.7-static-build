@@ -1,5 +1,5 @@
 From 1a9ff0120fdec528a1c24e28f62e4d1d7cfb197c Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Tue, 7 Jul 2026 00:54:08 +0800
 Subject: [PATCH 6/6] fix(webui): preserve virtual scroll on full update
 

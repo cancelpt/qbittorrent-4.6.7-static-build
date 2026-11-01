@@ -1,5 +1,5 @@
 From 958f312e218728d6e575a0885c87be51f024ef66 Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Sun, 26 Apr 2026 05:00:13 +0800
 Subject: [PATCH 2/4] Harden preferences test isolation and clamp boundaries
 

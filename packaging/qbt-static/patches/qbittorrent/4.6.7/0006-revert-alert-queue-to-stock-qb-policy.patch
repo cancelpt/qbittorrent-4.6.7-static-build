@@ -1,5 +1,5 @@
 From 8f3f56085ee5398adcabfd7c7a1af6db785f9d64 Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Wed, 8 Jul 2026 16:21:00 +0800
 Subject: [PATCH 6/6] revert: restore stock qB alert queue policy
 

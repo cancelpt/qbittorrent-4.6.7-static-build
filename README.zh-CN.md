@@ -4,12 +4,21 @@ English: [README.md](README.md)
 
 这个仓库保存的是一套用于构建 `qBittorrent 4.6.7` Linux `x86_64` 静态 `qbittorrent-nox` 的 wrapper、patch 集和 source overlay。上游 qBittorrent、libtorrent、Qt 以及静态构建工具链会在构建时拉取；仓库本身只保留 wrapper 自己维护的输入和测试。
 
+## 本次更新
+
+- WebUI 新增 Tracker 错误、其他错误和警告筛选，显示实时计数。
+- 已保存的分类失效时，自动恢复种子列表。
+- 存在正常工作的 Tracker 时，不再因备用地址失败而将种子归入错误筛选。
+
+版本说明见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 前置依赖
 
 - Linux `x86_64`
 - `docker`
 - `bash` 和 `rsync`
 - 用于仓库内验证的 `python3` 与 `pytest`
+- 用于 WebUI 回归测试的 Node.js 22 或更新版本
 
 ## 仓库结构
 
@@ -47,7 +56,7 @@ bash packaging/qbt-static/run-static-build.sh shell
 ## 构建基线
 
 - qBittorrent tag: `release-4.6.7`
-- 对外 release 版本: `v4.6.7-lt1.2.20-r2`
+- 对外 release 版本: `v4.6.7-lt1.2.20-r3`
 - 首选 libtorrent: `1.2.20`
 - 回退 libtorrent: `1.2.19`
 - Qt 主线: `6`
@@ -65,6 +74,7 @@ build/qbt-static/output/qbittorrent-nox
 
 ```bash
 python3 -m pytest tests/test_qbt_static_wrapper.py -q
+node --test tests/test_webui_filters.js
 ```
 
 构建后验证产物：
@@ -88,11 +98,11 @@ build/qbt-static/output/qbittorrent-nox --version
 - `ci.yml`
   在每次 push 和 pull request 上运行 shell 语法检查，以及 `python3 -m pytest tests/test_qbt_static_wrapper.py -q`
 - `release.yml`
-  在 `v*` 标签或手动 `workflow_dispatch` 时触发，对外使用 `v4.6.7-lt1.2.20-r2` 这类 canonical tag，运行 `packaging/qbt-static/run-static-build.sh build`，通过 `packaging/qbt-static/stage-release-assets.sh` 暂存 release 附件，并发布 GitHub Release assets，而不是把二进制提交进 git
+  构建标签对应的二进制和校验文件，先创建 GitHub Release 草稿，验证后再正式发布
 
 Release 产物包含：
 
-- `qbittorrent-nox-v4.6.7-lt1.2.20-r2-linux-x86_64-static`
+- `qbittorrent-nox-v4.6.7-lt1.2.20-r3-linux-x86_64-static`
 - `SHA256SUMS`
 - 配置签名时生成的 `SHA256SUMS.asc`
 

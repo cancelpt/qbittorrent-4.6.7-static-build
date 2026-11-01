@@ -547,6 +547,7 @@ namespace
             {KEY_TORRENT_COMPLETION_ON, qlonglong {}},
             {KEY_TORRENT_TRACKER, QString {}},
             {KEY_TORRENT_TRACKERS_COUNT, int {}},
+            {KEY_TORRENT_TRACKER_STATE, int {}},
             {KEY_TORRENT_DL_LIMIT, int {}},
             {KEY_TORRENT_UP_LIMIT, int {}},
             {KEY_TORRENT_AMOUNT_DOWNLOADED, qlonglong {}},
@@ -588,6 +589,7 @@ namespace
                 KEY_TORRENT_FORCE_START,
                 KEY_TORRENT_TRACKER,
                 KEY_TORRENT_TRACKERS_COUNT,
+                KEY_TORRENT_TRACKER_STATE,
                 KEY_TORRENT_AUTO_TORRENT_MANAGEMENT,
             };
             result.unite({
@@ -623,6 +625,7 @@ namespace
             KEY_TORRENT_FORCE_START,
             KEY_TORRENT_TRACKER,
             KEY_TORRENT_TRACKERS_COUNT,
+            KEY_TORRENT_TRACKER_STATE,
             KEY_TORRENT_AUTO_TORRENT_MANAGEMENT,
         };
 
