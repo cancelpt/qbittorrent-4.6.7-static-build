@@ -605,7 +605,8 @@ class QbtStaticWrapperTest(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(without_ceiling.returncode, 0)
-            self.assertIn("not a git repository", without_ceiling.stderr)
+            self.assertRegex(without_ceiling.stderr,
+                             r"not a git repository|gitfile does not point to a valid repository")
 
             with_ceiling = subprocess.run(
                 ["git", "ls-remote", "-q", "--symref", str(remote_src), "HEAD"],
