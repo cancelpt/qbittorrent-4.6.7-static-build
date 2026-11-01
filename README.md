@@ -4,12 +4,21 @@ Simplified Chinese: [README.zh-CN.md](README.zh-CN.md)
 
 This repository contains the wrapper, patch set, and source overlays used to build a reproducible Linux `x86_64` static `qbittorrent-nox` for `qBittorrent 4.6.7`. Upstream qBittorrent, libtorrent, Qt, and the static-build toolchain are fetched during the build; this repository keeps the wrapper-owned inputs and tests.
 
+## Latest changes
+
+- Adds WebUI Tracker error, Other error, and Warning filters with live counts.
+- Restores the torrent list when a saved category no longer exists.
+- Avoids reporting tracker errors when another tracker is working.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
 ## Prerequisites
 
 - Linux `x86_64`
 - `docker`
 - `bash` and `rsync`
 - `python3` and `pytest` for repository verification
+- Node.js 22 or later for WebUI regression tests
 
 ## Repository layout
 
@@ -47,7 +56,7 @@ bash packaging/qbt-static/run-static-build.sh shell
 ## Build baseline
 
 - qBittorrent tag: `release-4.6.7`
-- public release version: `v4.6.7-lt1.2.20-r2`
+- public release version: `v4.6.7-lt1.2.20-r3`
 - preferred libtorrent: `1.2.20`
 - fallback libtorrent: `1.2.19`
 - Qt line: `6`
@@ -65,6 +74,7 @@ Repository checks:
 
 ```bash
 python3 -m pytest tests/test_qbt_static_wrapper.py -q
+node --test tests/test_webui_filters.js
 ```
 
 Artifact checks after a build:
@@ -88,11 +98,11 @@ Repository automation lives under `.github/workflows/`:
 - `ci.yml`
   runs shell syntax checks plus `python3 -m pytest tests/test_qbt_static_wrapper.py -q` on every push and pull request
 - `release.yml`
-  triggers on `v*` tags or manual `workflow_dispatch`, uses canonical public tags such as `v4.6.7-lt1.2.20-r2`, runs `packaging/qbt-static/run-static-build.sh build`, stages release assets with `packaging/qbt-static/stage-release-assets.sh`, and publishes GitHub Release assets instead of committing binaries to git
+  builds tagged releases, stages the binary and checksums, and creates a draft GitHub Release for verification before publication
 
 Release bundles contain:
 
-- `qbittorrent-nox-v4.6.7-lt1.2.20-r2-linux-x86_64-static`
+- `qbittorrent-nox-v4.6.7-lt1.2.20-r3-linux-x86_64-static`
 - `SHA256SUMS`
 - `SHA256SUMS.asc` when signing is enabled
 

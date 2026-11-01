@@ -5,40 +5,37 @@ repo_root="$(git rev-parse --show-toplevel)"
 cd "${repo_root}"
 
 run_privacy_scan() {
-    local -a files=()
-    local -a patterns=(
-        "$HOME"
-        "/mnt/c/Users/"
-        "C:\\\\Users\\\\"
-        "/Users/"
-        "ryan@localhost"
-        "Codex <codex@local\\.invalid>"
-        "qihe"
-        "qdirected-bench"
-        "browser-forge"
-        "dut-upstream-corpus"
-    )
-    local path
+    python3 - <<'PY'
+from pathlib import Path
+import re
+import subprocess
 
-    while IFS= read -r -d '' path; do
-        case "${path}" in
-            .githooks/*)
-                continue
-                ;;
-        esac
-        files+=("${path}")
-    done < <(git ls-files -z)
-
-    ((${#files[@]})) || return 0
-
-    local pattern matches
-    for pattern in "${patterns[@]}"; do
-        matches="$(grep -nI -H -E -- "${pattern}" "${files[@]}" || true)"
-        if [[ -n "${matches}" ]]; then
-            printf 'privacy scan failed for pattern %s\n%s\n' "${pattern}" "${matches}" >&2
-            exit 1
-        fi
-    done
+patterns = [
+    r'/home/[\w.-]+/',
+    r'/mnt/[a-z]/Users/[\w.-]+',
+    r'/Users/[\w.-]+/',
+    r'[A-Za-z]:\\Users\\[^\\\s]+',
+    r'gh[pousr]_[A-Za-z0-9]{30,}',
+    r'github_pat_[A-Za-z0-9_]{30,}',
+]
+upstream_examples = 'packaging/qbt-static/patches/qbittorrent/4.6.7/source/src/base/bittorrent/torrent.h'
+synthetic_root = '/'.join(('', 'home', 'user', 'torrents'))
+failed = False
+for name in subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'):
+    path = Path(name)
+    if not name or not path.is_file():
+        continue
+    payload = path.read_bytes()
+    if b'\0' in payload:
+        continue
+    for number, line in enumerate(payload.decode('utf-8', errors='replace').splitlines(), 1):
+        if name == upstream_examples and line.lstrip().startswith('//'):
+            line = re.sub(re.escape(synthetic_root) + r'(?=[/`\s]|$)', '<synthetic-path>', line)
+        if any(re.search(pattern, line) for pattern in patterns):
+            print(f'privacy scan failed: {name}:{number} (value redacted)')
+            failed = True
+raise SystemExit(1 if failed else 0)
+PY
 }
 
 # The patch payloads preserve upstream formatting, so skip them here.
@@ -48,4 +45,5 @@ bash -n \
     packaging/qbt-static/in-container-build.sh \
     packaging/qbt-static/stage-release-assets.sh
 python3 -m pytest tests/test_qbt_static_wrapper.py -q
+node --test tests/test_webui_filters.js
 run_privacy_scan

@@ -24,7 +24,7 @@ COMPAT_PATCH = "9000-static-qt610-compat.diff"
 NARROW_PAYLOAD_PATCH = "0005-feat-narrow-steady-state-payload-policy.patch"
 FULL_UPDATE_SCROLL_PATCH = "0006-fix-preserve-virtual-scroll-on-full-update.patch"
 ALERT_QUEUE_ROLLBACK_PATCH = "0006-revert-alert-queue-to-stock-qb-policy.patch"
-PUBLIC_RELEASE_VERSION = "v4.6.7-lt1.2.20-r2"
+PUBLIC_RELEASE_VERSION = "v4.6.7-lt1.2.20-r3"
 PUBLIC_RELEASE_ASSET_NAME = f"qbittorrent-nox-{PUBLIC_RELEASE_VERSION}-linux-x86_64-static"
 LEGACY_RELEASE_ASSET_NAME = "qbittorrent-nox-4.6.7-linux-x86_64-static"
 MEMORY_PROBE_SOURCE_MARKERS = {
@@ -465,6 +465,123 @@ class QbtStaticWrapperTest(unittest.TestCase):
         self.assertIn('export qbt_workflow_files="${QBT_STATIC_WORKFLOW_FILES}"', in_container_text)
         self.assertRegex(wrapper_text, r"build\)\s+shift\s+stage_overlay(?: > /dev/null)?\s+run_container build")
 
+    def test_build_replaces_stale_prefix_patch_overlay(self) -> None:
+        entrypoint = IN_CONTAINER.read_text(encoding="utf-8")
+        start = entrypoint.index("run_build() {")
+        end = entrypoint.index("\n}\n", start) + len("\n}\n")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            work = root / "work"
+            overlay = work / "patches" / "example"
+            overlay.mkdir(parents=True)
+            (overlay / "current.patch").write_text("current", encoding="utf-8")
+            prefix_overlay = work / "prefix" / "patches" / "example"
+            prefix_overlay.mkdir(parents=True)
+            stale = prefix_overlay / "stale.patch"
+            stale.write_text("stale", encoding="utf-8")
+            upstream = root / "upstream"
+            upstream.mkdir()
+            (upstream / "qbt-nox-static.bash").write_text("exit 0\n", encoding="utf-8")
+            (root / "logs").mkdir()
+            (root / "output").mkdir()
+            script = "\n".join([
+                "set -euo pipefail",
+                "work_dir=$1; upstream_dir=$2; log_dir=$3; output_dir=$4",
+                "prepare_upstream() { :; }",
+                "clean_stale_qt_sql_driver_artifacts() { :; }",
+                "bootstrap_build_dependencies() { :; }",
+                "resolve_libtorrent_inputs() { printf '1.2\\n1.2.20\\n'; }",
+                "QBT_STATIC_LT_VERSION=1.2.20; QBT_STATIC_QB_TAG=release-4.6.7",
+                "QBT_STATIC_QT_VERSION=6; QBT_STATIC_BUILD_TOOL=cmake",
+                "QBT_STATIC_WORKFLOW_FILES=yes",
+                entrypoint[start:end],
+                "run_build",
+            ])
+            result = subprocess.run(
+                ["bash", "-c", script, "overlay-test", str(work), str(upstream),
+                 str(root / "logs"), str(root / "output")],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(stale.exists(), "stale prefix overlays must not survive staging")
+            self.assertEqual((prefix_overlay / "current.patch").read_text(encoding="utf-8"), "current")
+
+    def test_release_upload_refuses_published_assets(self) -> None:
+        workflow = (REPO_ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        script = workflow.split("      - name: Stage draft GitHub Release assets\n", 1)[1].split("        run: |\n", 1)[1]
+        script = "\n".join(line[10:] for line in script.splitlines())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            release_dir = root / "release-assets"
+            release_dir.mkdir()
+            (release_dir / "SHA256SUMS").write_text("synthetic", encoding="utf-8")
+            for state, expected in [("missing", "create"), ("true", "upload"), ("false", None)]:
+                log = root / "calls"
+                log.unlink(missing_ok=True)
+                stub = "\n".join([
+                    "set -euo pipefail",
+                    "gh() {",
+                    "  if [[ $1 == release && $2 == view ]]; then",
+                    "    [[ $STUB_STATE != missing ]] || return 1",
+                    "    if [[ $# -gt 3 ]]; then printf '%s\\n' \"$STUB_STATE\"; fi",
+                    "    return 0",
+                    "  fi",
+                    "  printf '%s\\n' \"$*\" >> \"$STUB_CALLS\"",
+                    "}", script,
+                ])
+                result = subprocess.run(["bash", "-c", stub], capture_output=True, text=True,
+                    env={**os.environ, "RUNNER_TEMP": str(root), "QBT_RELEASE_TAG": PUBLIC_RELEASE_VERSION,
+                         "QBT_STATIC_PUBLIC_RELEASE_VERSION": PUBLIC_RELEASE_VERSION,
+                         "STUB_STATE": state, "STUB_CALLS": str(log)})
+                if expected is None:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(log.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    calls = log.read_text(encoding="utf-8")
+                    self.assertIn("release " + expected, calls)
+                    if expected == "create":
+                        self.assertIn("--draft", calls)
+
+    def test_privacy_scan_allows_only_documented_upstream_paths(self) -> None:
+        hook = (REPO_ROOT / ".githooks/pre-commit").read_text(encoding="utf-8")
+        scanner = hook.split("    python3 - <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            upstream = root / SOURCE_OVERRIDE_DIR.relative_to(REPO_ROOT) / "src/base/bittorrent/torrent.h"
+            upstream.parent.mkdir(parents=True)
+            synthetic_root = "/".join(("", "home", "user", "torrents"))
+            upstream.write_text("// Example " + synthetic_root + "/example\n", encoding="utf-8")
+            fixture = root / "fixture.txt"
+            fixtures = [
+                "/".join(("", "home", "synthetic-user", "private")),
+                "/".join(("", "mnt", "c", "Users", "synthetic-user", "private")),
+                "\\".join(("C:", "Users", "synthetic-user", "private")),
+                "ghp_" + "x" * 40,
+            ]
+            fixture.write_text("<synthetic-placeholder>\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", str(upstream.relative_to(root)), "fixture.txt"], cwd=root, check=True)
+            result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            for value in fixtures:
+                fixture.write_text(value + "\n", encoding="utf-8")
+                result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("value redacted", result.stdout)
+                self.assertNotIn(value, result.stdout + result.stderr)
+            fixture.write_text(synthetic_root + "/example\n", encoding="utf-8")
+            result = subprocess.run(["python3", "-c", scanner], cwd=root, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0, "the upstream example exemption is path-specific")
+
+    def test_tracker_summary_is_kept_in_compact_and_descriptive_paths(self) -> None:
+        store = (SOURCE_OVERRIDE_DIR / "src/webui/api/maindatasyncstore.cpp").read_text(encoding="utf-8")
+        for section in ["compactTorrentFieldSpecs", "descriptiveCompactTorrentFieldKeys", "descriptiveStatusCompactTorrentFieldKeys"]:
+            block = store.split(section + "()", 1)[1].split("return ", 1)[0]
+            self.assertIn("KEY_TORRENT_TRACKER_STATE", block, section)
+        serializer = (SOURCE_OVERRIDE_DIR / "src/webui/api/serialize/serialize_torrent.cpp").read_text(encoding="utf-8")
+        self.assertEqual(serializer.count("insertTrackerFields(serialized, torrent);"), 2)
+
     def test_in_container_script_sets_git_ceiling_to_avoid_broken_worktree_gitdir_discovery(self) -> None:
         in_container_text = IN_CONTAINER.read_text(encoding="utf-8")
 
@@ -488,7 +605,8 @@ class QbtStaticWrapperTest(unittest.TestCase):
                 text=True,
             )
             self.assertNotEqual(without_ceiling.returncode, 0)
-            self.assertIn("not a git repository", without_ceiling.stderr)
+            self.assertRegex(without_ceiling.stderr,
+                             r"not a git repository|gitfile does not point to a valid repository")
 
             with_ceiling = subprocess.run(
                 ["git", "ls-remote", "-q", "--symref", str(remote_src), "HEAD"],

@@ -1,5 +1,5 @@
 From ea6058c4f725321b32a4c6e0c75f91ec0cd0a795 Mon Sep 17 00:00:00 2001
-From: cancelpt <cancelpt@gmail.com>
+From: cancelpt <cancelpt@users.noreply.github.com>
 Date: Mon, 27 Apr 2026 06:43:54 +0800
 Subject: [PATCH 4/4] feat: share WebUI maindata state and virtualize torrent
  list

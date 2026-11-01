@@ -108,6 +108,14 @@ if gnu_mirror:
 
 lines = [line.replace("--retry-max-time 25", "--retry-max-time 300") for line in lines]
 
+# Pin all workflow assets to the r2-era release (glibc 2.43 / openssl / boost / qt6 etc.).
+# Upstream latest has since rolled glibc to 2.44 and openssl to an API incompatible
+# with libtorrent 1.2.20 (ASN1_STRING opaque), breaking the pinned qB 4.6.7 line.
+lines = [line.replace(
+    "https://github.com/userdocs/qbt-workflow-files/releases/latest/download/",
+    "https://github.com/userdocs/qbt-workflow-files/releases/download/2431321311197833621910112202013210340515196111523/"
+) for line in lines]
+
 glibc_idx = next(
     (
         idx
@@ -257,6 +265,7 @@ run_build() {
 
     prepare_upstream
     if [[ -d "${work_dir}/patches" ]]; then
+        rm -rf "${prefix_dir}/patches"
         mkdir -p "${prefix_dir}/patches"
         cp -a "${work_dir}/patches/." "${prefix_dir}/patches/"
     fi

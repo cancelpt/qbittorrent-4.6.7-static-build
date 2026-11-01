@@ -63,6 +63,9 @@ let setTagFilter = function() {};
 /* Trackers filter */
 const TRACKERS_ALL = 1;
 const TRACKERS_TRACKERLESS = 2;
+const TRACKERS_ERROR = 3;
+const TRACKERS_WARNING = 4;
+const TRACKERS_ANNOUNCE_ERROR = 5;
 
 const trackerList = new Map();
 
@@ -234,6 +237,19 @@ window.addEvent('load', function() {
     buildRssTab();
     buildLogTab();
     MochaUI.initializeTabs('mainWindowTabsList');
+
+    const normalizeCategoryFilter = function() {
+        const categoryHash = Number(selected_category);
+        if (((selected_category !== null) && (selected_category !== ""))
+            && Number.isInteger(categoryHash)
+            && ((categoryHash === CATEGORIES_ALL) || (categoryHash === CATEGORIES_UNCATEGORIZED)
+                || Object.prototype.hasOwnProperty.call(category_list, categoryHash)))
+            return false;
+
+        selected_category = CATEGORIES_ALL;
+        LocalPreferences.set('selected_category', selected_category);
+        return true;
+    };
 
     setCategoryFilter = function(hash) {
         selected_category = hash;
@@ -595,9 +611,9 @@ window.addEvent('load', function() {
 
         trackerFilterList.getChildren().each(c => c.destroy());
 
-        const createLink = function(hash, text, count) {
+        const createLink = function(hash, text, count, icon) {
             const html = '<a href="#" onclick="setTrackerFilter(' + hash + ');return false;">'
-                + '<img src="images/trackers.svg"/>'
+                + '<img src="' + (icon || 'images/trackers.svg') + '"/>'
                 + window.qBittorrent.Misc.escapeHtml(text.replace("%1", count)) + '</a>';
             const el = new Element('li', {
                 id: hash,
@@ -615,6 +631,24 @@ window.addEvent('load', function() {
                 trackerlessTorrentsCount += 1;
         }
         trackerFilterList.appendChild(createLink(TRACKERS_TRACKERLESS, 'QBT_TR(Trackerless (%1))QBT_TR[CONTEXT=TrackerFiltersList]', trackerlessTorrentsCount));
+
+        let errorTorrentsCount = 0;
+        let announceErrorTorrentsCount = 0;
+        let warningTorrentsCount = 0;
+        for (const key in torrentsTable.rows) {
+            if (!Object.prototype.hasOwnProperty.call(torrentsTable.rows, key))
+                continue;
+            const trackerState = (torrentsTable.rows[key]['full_data'].tracker_state || 0);
+            if (trackerState & 2)
+                errorTorrentsCount += 1;
+            if (trackerState & 4)
+                announceErrorTorrentsCount += 1;
+            if (trackerState & 1)
+                warningTorrentsCount += 1;
+        }
+        trackerFilterList.appendChild(createLink(TRACKERS_ERROR, 'QBT_TR(Tracker error (%1))QBT_TR[CONTEXT=TrackerFiltersList]', errorTorrentsCount, 'images/error.svg'));
+        trackerFilterList.appendChild(createLink(TRACKERS_ANNOUNCE_ERROR, 'QBT_TR(Other error (%1))QBT_TR[CONTEXT=TrackerFiltersList]', announceErrorTorrentsCount, 'images/error.svg'));
+        trackerFilterList.appendChild(createLink(TRACKERS_WARNING, 'QBT_TR(Warning (%1))QBT_TR[CONTEXT=TrackerFiltersList]', warningTorrentsCount, 'images/dialog-warning.svg'));
 
         // Sort trackers by hostname
         const sortedList = [...trackerList.entries()].sort((left, right) => {
@@ -664,7 +698,6 @@ window.addEvent('load', function() {
                     let preservedViewportState = null;
                     let update_categories = false;
                     let updateTags = false;
-                    let updateTrackers = false;
                     const full_update = (response['full_update'] === true);
                     if (full_update) {
                         torrentsTableSelectedRows = torrentsTable.selectedRowsIds();
@@ -749,7 +782,6 @@ window.addEvent('load', function() {
                                 torrents: merged_torrents
                             });
                         }
-                        updateTrackers = true;
                     }
                     if (response['trackers_removed']) {
                         for (let i = 0; i < response['trackers_removed'].length; ++i) {
@@ -757,7 +789,6 @@ window.addEvent('load', function() {
                             const hash = genHash(getHost(tracker));
                             trackerList.delete(hash);
                         }
-                        updateTrackers = true;
                     }
                     if (response['torrents']) {
                         let updateTorrentList = false;
@@ -786,6 +817,8 @@ window.addEvent('load', function() {
                             removeTorrentFromTagList(hash);
                             updateTags = true; // Always to update All tag
                         });
+                    if (normalizeCategoryFilter())
+                        update_categories = true;
                     torrentsTable.updateTable(full_update);
                     if (full_update)
                         torrentsTable.restoreViewportState(preservedViewportState);
@@ -805,8 +838,7 @@ window.addEvent('load', function() {
                         updateTagList();
                         window.qBittorrent.TransferList.contextMenu.updateTagsSubMenu(tagList);
                     }
-                    if (updateTrackers)
-                        updateTrackerList();
+                    updateTrackerList();
 
                     if (full_update)
                         // re-select previously selected rows

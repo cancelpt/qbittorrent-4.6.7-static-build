@@ -70,6 +70,7 @@ inline const QString KEY_TORRENT_ADDED_ON = u"added_on"_s;
 inline const QString KEY_TORRENT_COMPLETION_ON = u"completion_on"_s;
 inline const QString KEY_TORRENT_TRACKER = u"tracker"_s;
 inline const QString KEY_TORRENT_TRACKERS_COUNT = u"trackers_count"_s;
+inline const QString KEY_TORRENT_TRACKER_STATE = u"tracker_state"_s;
 inline const QString KEY_TORRENT_DL_LIMIT = u"dl_limit"_s;
 inline const QString KEY_TORRENT_UP_LIMIT = u"up_limit"_s;
 inline const QString KEY_TORRENT_AMOUNT_DOWNLOADED = u"downloaded"_s;
